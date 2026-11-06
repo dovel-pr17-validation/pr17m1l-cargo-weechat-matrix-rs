@@ -1,0 +1,3303 @@
+//! Matrix server abstraction.
+//!
+//! A MatrixServer is created for every server the user configures.
+//!
+//! It will create a per server config subsection. If options are added to the
+//! server they need to be removed from the server section when the server is
+//! dropped.
+//!
+//! The server will create a tokio runtime which will spawn a task for the sync
+//! loop.
+//!
+//! It will also spawn a task on the Weechat mainloop, this one waits for
+//! responses from the sync loop.
+//!
+//! A separate task is spawned every time Weechat wants to send a message to the
+//! server.
+//!
+//!
+//! Schematically this looks like the following diagram.
+//!
+//!                                 MatrixServer
+//!   +--------------------------------------------------------------------+
+//!   |                                                                    |
+//!   |         Weechat mainloop                     Tokio runtime         |
+//!   |   +---------------------------+        +------------------------+  |
+//!   |   |                           |        |                        |  |
+//!   |   |  +--------------------+   |        |   +----------------+   |  |
+//!   |   |  |                    |   |        |   |                |   |  |
+//!   |   |  |  Response receiver +<---------------+   Sync loop    |   |  |
+//!   |   |  |                    |   |        |   |                |   |  |
+//!   |   |  |                    |   |        |   |                |   |  |
+//!   |   |  +--------------------+   |        |   +----------------+   |  |
+//!   |   |                           |        |                        |  |
+//!   |   |  +--------------------+   |        |   +----------------+   |  |
+//!   |   |  |                    |   |  Spawn |   |                |   |  |
+//!   |   |  |  Roombuffer input  +--------------->+ Send coroutine |   |  |
+//!   |   |  |      callback      +<---------------+                |   |  |
+//!   |   |  |                    |   |        |   |                |   |  |
+//!   |   |  +--------------------+   |        |   +----------------+   |  |
+//!   |   |                           |        |                        |  |
+//!   |   +---------------------------+        +------------------------+  |
+//!   |                                                                    |
+//!   +--------------------------------------------------------------------+
+//!
+//!
+//! The tokio runtime and response receiver task will be alive only if the user
+//! connects to the server while the room buffer input callback will print an
+//! error if the server is disconnected.
+//!
+//! The server holds all the rooms which in turn hold the buffers, users, and
+//! room metadata.
+//!
+//! The response receiver forwards events to the correct room. The response
+//! receiver fetches events individually from a mpsc channel. This makes sure
+//! that processing events will not block the Weechat mainloop for too long.
+
+use chrono::{offset::Utc, DateTime};
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
+    io::Write,
+    path::{Path, PathBuf},
+    rc::{Rc, Weak},
+    time::Duration,
+};
+use tracing::error;
+use url::Url;
+
+use matrix_sdk::{
+    self,
+    deserialized_responses::AmbiguityChange,
+    encryption::{LocalTrust, RoomKeyImportResult},
+    media::{MediaFormat, MediaRequestParameters},
+    room::Room,
+    ruma::{
+        api::client::{
+            room::create_room::v3::Request as CreateRoomRequest,
+            session::login::v3::Response as LoginResponse,
+        },
+        api::error::ErrorKind,
+        events::{
+            room::{
+                member::RoomMemberEventContent,
+                tombstone::RoomTombstoneEventContent, MediaSource,
+            },
+            AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+            AnyToDeviceEvent, SyncStateEvent,
+        },
+        DeviceId, DeviceKeyAlgorithm, MilliSecondsSinceUnixEpoch,
+        OwnedDeviceId, OwnedMxcUri, OwnedRoomAliasId, OwnedRoomId,
+        OwnedRoomOrAliasId, OwnedServerName, OwnedUserId, RoomAliasId, RoomId,
+        UserId,
+    },
+    Client, Error, RoomState, SessionTokens,
+};
+
+use weechat::{
+    buffer::{Buffer, BufferBuilder, BufferHandle},
+    config::{BooleanOptionSettings, ConfigSection, StringOptionSettings},
+    Prefix, Weechat,
+};
+
+const JOIN_ROOM_TIMEOUT: Duration = Duration::from_secs(120);
+const ROOM_UPGRADE_CHAIN_LIMIT: usize = 32;
+
+use crate::{
+    config::ServerBuffer,
+    connection::{Connection, InteractiveAuthInfo},
+    room::RoomHandle,
+    thread_continuation::{ThreadContinuationState, ThreadKey},
+    verification_buffer::VerificationBuffer,
+    ConfigHandle, Servers, PLUGIN_NAME,
+};
+
+fn secure_set_token_command(name: &str, token: &str) -> Option<String> {
+    let safe = !token.is_empty()
+        && token.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '.' | '_' | '~' | '+' | '/' | '=')
+        });
+
+    safe.then(|| format!("/secure set {name} {token}"))
+}
+
+fn room_key_withheld_message(
+    code: &matrix_sdk::ruma::events::room_key::withheld::RoomKeyWithheldCodeInfo,
+    sender: &UserId,
+    own_user_id: Option<&UserId>,
+    reason: Option<&str>,
+) -> String {
+    use matrix_sdk::ruma::events::room_key::withheld::RoomKeyWithheldCodeInfo;
+
+    let is_own_sender = own_user_id == Some(sender);
+    match code {
+        RoomKeyWithheldCodeInfo::Unavailable(_) if is_own_sender => {
+            format!(
+                "{sender} withheld the room key: your other device does not \
+                 have this key. This device cannot recover that message from it."
+            )
+        }
+        RoomKeyWithheldCodeInfo::Unavailable(_) => format!(
+            "{sender} withheld the room key: the room key is not available on \
+             their device."
+        ),
+        RoomKeyWithheldCodeInfo::Unverified(_) if is_own_sender => {
+            format!(
+                "{sender} withheld the room key: this device is not verified \
+                 by your other device."
+            )
+        }
+        RoomKeyWithheldCodeInfo::Unverified(_) => format!(
+            "{sender} withheld the room key: your device is not verified and \
+             they only share keys with verified devices."
+        ),
+        RoomKeyWithheldCodeInfo::Blacklisted(_) if is_own_sender => {
+            format!(
+                "{sender} withheld the room key: this device is blacklisted by \
+                 your other device."
+            )
+        }
+        RoomKeyWithheldCodeInfo::Blacklisted(_) => format!(
+            "{sender} withheld the room key: your device is blacklisted."
+        ),
+        RoomKeyWithheldCodeInfo::Unauthorized(_) if is_own_sender => {
+            format!(
+                "{sender} withheld the room key: this device is not entitled to \
+                 that room key."
+            )
+        }
+        RoomKeyWithheldCodeInfo::Unauthorized(_) => format!(
+            "{sender} withheld the room key: this device will not be given that \
+             room key by that sender."
+        ),
+        RoomKeyWithheldCodeInfo::NoOlm if is_own_sender => format!(
+            "{sender} withheld the room key: your other device could not \
+             establish an encrypted session with this device. Keep this client \
+             connected; new messages should decrypt once a session is \
+             established."
+        ),
+        RoomKeyWithheldCodeInfo::NoOlm => format!(
+            "{sender} withheld the room key: they could not establish an \
+             encrypted session with this device. Messages they sent before now \
+             cannot be recovered from them. Keep this client connected; new \
+             messages should decrypt once a session is established."
+        ),
+        other => {
+            let mut message = format!(
+                "{sender} withheld the room key with code: {}.",
+                other.code()
+            );
+            if let Some(reason) = reason {
+                message.push_str(&format!(" Reason given: {reason}"));
+            }
+            message
+        }
+    }
+}
+
+fn tombstone_replacement_room_id(
+    event: &SyncStateEvent<RoomTombstoneEventContent>,
+) -> Option<OwnedRoomId> {
+    event
+        .as_original()
+        .map(|event| event.content.replacement_room.clone())
+}
+
+fn with_entered_runtime_until_final_drop<F>(
+    runtime: Rc<tokio::runtime::Runtime>,
+    f: F,
+) where
+    F: FnOnce(),
+{
+    with_entered_runtime_until_drop(runtime, f, drop);
+}
+
+fn with_entered_runtime_until_drop<F, D>(
+    runtime: Rc<tokio::runtime::Runtime>,
+    f: F,
+    drop_runtime: D,
+) where
+    F: FnOnce(),
+    D: FnOnce(Rc<tokio::runtime::Runtime>),
+{
+    let handle = runtime.handle().clone();
+    let guard = handle.enter();
+
+    f();
+
+    drop_runtime(runtime);
+    drop(guard);
+}
+
+#[derive(Debug)]
+pub enum ServerError {
+    StartError(String),
+    ClientError(matrix_sdk::ClientBuildError),
+    IoError(String),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeviceTrust {
+    Verified,
+    Unverified,
+    MissingKeys,
+    Unsupported,
+}
+
+fn device_trust_label(device_trust: DeviceTrust) -> &'static str {
+    match device_trust {
+        DeviceTrust::Verified => "Trusted",
+        DeviceTrust::Unverified => "Not trusted",
+        DeviceTrust::MissingKeys => "No uploaded keys",
+        DeviceTrust::Unsupported => "No encryption support",
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServerSettings {
+    pub homeserver: Option<Url>,
+    pub proxy: Option<Url>,
+    pub autoconnect: bool,
+    pub username: String,
+    pub password: String,
+    pub access_token: String,
+    pub refresh_token: String,
+    pub device_id: String,
+    pub ssl_verify: bool,
+}
+
+impl Default for ServerSettings {
+    fn default() -> Self {
+        Self {
+            ssl_verify: true,
+            proxy: None,
+            autoconnect: false,
+            homeserver: None,
+            username: "".to_owned(),
+            password: "".to_owned(),
+            access_token: "".to_owned(),
+            refresh_token: "".to_owned(),
+            device_id: "".to_owned(),
+        }
+    }
+}
+
+impl ServerSettings {
+    pub fn new() -> Self {
+        Default::default()
+    }
+}
+
+pub struct LoginInfo {
+    user_id: OwnedUserId,
+}
+
+#[derive(Clone)]
+pub struct MatrixServer {
+    pub(crate) inner: Rc<InnerServer>,
+}
+
+impl std::ops::Deref for MatrixServer {
+    type Target = InnerServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::fmt::Debug for MatrixServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut fmt = f.debug_struct("MatrixServer");
+        fmt.field("name", &self.server_name).finish()
+    }
+}
+
+pub struct InnerServer {
+    self_weak: RefCell<Weak<InnerServer>>,
+    servers: Servers,
+    server_name: Rc<str>,
+    rooms: Rc<RefCell<HashMap<OwnedRoomId, RoomHandle>>>,
+    pending_room_metadata:
+        RefCell<HashMap<OwnedRoomId, (bool, Option<String>)>>,
+    settings: Rc<RefCell<ServerSettings>>,
+    current_settings: Rc<RefCell<ServerSettings>>,
+    config: ConfigHandle,
+    client: Rc<RefCell<Option<Client>>>,
+    login_state: Rc<RefCell<Option<LoginInfo>>>,
+    connection: Rc<RefCell<Option<Connection>>>,
+    server_buffer: Rc<RefCell<Option<BufferHandle>>>,
+    verification_buffers: Rc<RefCell<HashMap<String, VerificationBuffer>>>,
+    thread_continuations: tokio::sync::Mutex<Option<ThreadContinuationState>>,
+    thread_continuation_send_lock: tokio::sync::Mutex<()>,
+}
+
+pub(crate) enum ThreadRoute {
+    Current {
+        room: RoomHandle,
+        thread_root: matrix_sdk::ruma::OwnedEventId,
+    },
+    CreateRoot {
+        room: RoomHandle,
+        continuation_source: ThreadKey,
+    },
+}
+
+impl MatrixServer {
+    pub fn new(
+        name: &str,
+        config: &ConfigHandle,
+        server_section: &mut ConfigSection,
+        servers: Servers,
+    ) -> Self {
+        let server_name: Rc<str> = name.to_string().into();
+
+        let server = InnerServer {
+            self_weak: RefCell::new(Weak::new()),
+            servers,
+            server_name: server_name.clone(),
+            rooms: Rc::new(RefCell::new(HashMap::new())),
+            pending_room_metadata: RefCell::new(HashMap::new()),
+            settings: Rc::new(RefCell::new(ServerSettings::new())),
+            current_settings: Rc::new(RefCell::new(ServerSettings::new())),
+            config: config.clone(),
+            client: Rc::new(RefCell::new(None)),
+            login_state: Rc::new(RefCell::new(None)),
+            connection: Rc::new(RefCell::new(None)),
+            server_buffer: Rc::new(RefCell::new(None)),
+            verification_buffers: Rc::new(RefCell::new(HashMap::new())),
+            thread_continuations: tokio::sync::Mutex::new(None),
+            thread_continuation_send_lock: tokio::sync::Mutex::new(()),
+        };
+
+        let server: Rc<InnerServer> = server.into();
+        *server.self_weak.borrow_mut() = Rc::downgrade(&server);
+
+        MatrixServer::create_server_conf(&server_name, server_section, &server);
+
+        MatrixServer { inner: server }
+    }
+
+    pub fn clone_weak(&self) -> Weak<InnerServer> {
+        Rc::downgrade(&self.inner)
+    }
+
+    /// Join a Matrix room by ID or alias.
+    pub async fn join_room(&self, room_id_or_alias: String) {
+        let Ok(room_id_or_alias) =
+            room_id_or_alias.parse::<OwnedRoomOrAliasId>()
+        else {
+            self.print_error("Invalid room ID or alias.");
+            return;
+        };
+
+        let Some(connection) = self.connection() else {
+            self.print_error("Not connected. Please connect first.");
+            return;
+        };
+
+        self.print_network(&format!("Joining room {}...", room_id_or_alias));
+
+        let client = connection.client().clone();
+        let target = room_id_or_alias.to_string();
+        let result = connection
+            .spawn(async move {
+                tokio::time::timeout(JOIN_ROOM_TIMEOUT, async move {
+                    join_room_or_create_local_alias(&client, &room_id_or_alias)
+                        .await
+                })
+                .await
+            })
+            .await;
+
+        match result {
+            Ok(Ok(room)) => {
+                let room_id = room.room_id().to_owned();
+                if !self.rooms.borrow().contains_key(&room_id) {
+                    self.restore_room(room).await;
+                }
+                let room = self.rooms.borrow().get(&room_id).cloned();
+                if let Some(room) = room {
+                    let room = self.latest_room_for(&room).await;
+                    if let Ok(buffer) = room.buffer_handle().upgrade() {
+                        buffer.switch_to();
+                    }
+                }
+                self.print_network(&format!(
+                    "Successfully joined room {}",
+                    room_id
+                ));
+            }
+            Ok(Err(error)) => {
+                self.print_error(&format!(
+                    "Failed to join {}: {}",
+                    target, error
+                ));
+            }
+            Err(error) => {
+                self.print_error(&format!(
+                    "Timed out joining {} after {} seconds: {}",
+                    target,
+                    JOIN_ROOM_TIMEOUT.as_secs(),
+                    error
+                ));
+            }
+        }
+    }
+
+    pub fn connect(&self) -> Result<(), ServerError> {
+        if self.connected() {
+            self.print_error(&format!(
+                "Already connected to {}{}{}",
+                Weechat::color("chat_server"),
+                self.name(),
+                Weechat::color("reset")
+            ));
+
+            return Ok(());
+        }
+
+        let client = self.get_or_create_client()?;
+        let connection = Connection::new(self, &client);
+        self.set_connection(connection);
+
+        self.print_network(&format!(
+            "Connected to {}{}{}",
+            Weechat::color("chat_server"),
+            self.name(),
+            Weechat::color("reset")
+        ));
+
+        Ok(())
+    }
+
+    pub fn complete_sso_login(&self, login_token: String) {
+        if self
+            .get_client()
+            .map(|client| client.matrix_auth().logged_in())
+            .unwrap_or(false)
+        {
+            self.print_error(&format!(
+                "Already connected to {}{}{}",
+                Weechat::color("chat_server"),
+                self.name(),
+                Weechat::color("reset")
+            ));
+            return;
+        }
+
+        if self.connected() {
+            self.connection.borrow_mut().take();
+        }
+
+        let client = match self.get_or_create_client() {
+            Ok(client) => client,
+            Err(e) => {
+                self.print_error(&format!(
+                    "Failed to create Matrix client: {:?}",
+                    e
+                ));
+                return;
+            }
+        };
+
+        let server_name = self.name().to_owned();
+        let server_path = self.get_server_path();
+
+        let response = self.servers.runtime().block_on(async {
+            client
+                .matrix_auth()
+                .login_token(&login_token)
+                .initial_device_display_name("WeeChat-Matrix-rs")
+                .send()
+                .await
+        });
+
+        match response {
+            Ok(response) => {
+                if let Err(e) = Connection::save_device_id(
+                    &server_name,
+                    server_path,
+                    &response,
+                ) {
+                    self.print_error(&format!(
+                        "Error while writing the device id for server {}{}{}: {:?}",
+                        Weechat::color("chat_server"),
+                        self.name(),
+                        Weechat::color("reset"),
+                        e
+                    ));
+                    return;
+                }
+
+                self.receive_login(response);
+                let connection = Connection::new(self, &client);
+                self.set_connection(connection);
+                self.print_network(&format!(
+                    "Completed SSO login for {}{}{}",
+                    Weechat::color("chat_server"),
+                    self.name(),
+                    Weechat::color("reset")
+                ));
+            }
+            Err(e) => {
+                self.print_error(&format!(
+                    "Failed to complete SSO login: {:?}",
+                    e
+                ));
+            }
+        }
+    }
+
+    fn inner(&self) -> Rc<InnerServer> {
+        self.inner.clone()
+    }
+
+    pub fn merge_server_buffers(&self) {
+        let server_buffer = self.inner.server_buffer.borrow_mut();
+
+        if let Some(buffer) =
+            server_buffer.as_ref().and_then(|b| b.upgrade().ok())
+        {
+            self.inner.merge_server_buffer(&buffer);
+        }
+    }
+
+    /// Parse an URL returning a None if the string is empty.
+    ///
+    /// # Panics
+    ///
+    /// This panics if the string can't be parsed as an URL.
+    fn parse_url_unchecked(value: &str) -> Option<Url> {
+        if value.is_empty() {
+            None
+        } else {
+            Some(
+                Url::parse(value)
+                    .expect("Can't parse URL, did the check callback fail?"),
+            )
+        }
+    }
+
+    /// Parse an URL returning an error if the parse step fails.
+    pub fn parse_url(value: String) -> Result<(), String> {
+        let url = Url::parse(&value);
+
+        match url {
+            Ok(u) => {
+                if u.cannot_be_a_base() {
+                    Err(String::from("The Homeserver URL is missing a schema"))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Check if the provided value is a valid URL.
+    fn is_url_valid(value: &str) -> bool {
+        if value.is_empty() {
+            true
+        } else {
+            MatrixServer::parse_url(value.to_string()).is_ok()
+        }
+    }
+
+    fn create_server_conf(
+        server_name: &str,
+        server_section: &mut ConfigSection,
+        server_ref: &Rc<InnerServer>,
+    ) {
+        let server = Rc::downgrade(server_ref);
+        let server_copy = server.clone();
+        let autoconnect =
+            BooleanOptionSettings::new(format!("{}.autoconnect", server_name))
+                .set_change_callback(move |_, option| {
+                    let value = option.value();
+
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().autoconnect = value;
+                });
+
+        server_section
+            .new_boolean_option(autoconnect)
+            .expect("Can't create autoconnect option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let homeserver =
+            StringOptionSettings::new(format!("{}.homeserver", server_name))
+                .set_check_callback(|_, _, value| {
+                    Weechat::eval_string_expression(&value)
+                        .map(|value| MatrixServer::is_url_valid(&value))
+                        .unwrap_or(false)
+                })
+                .set_change_callback(move |_, option| {
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    let homeserver =
+                        Weechat::eval_string_expression(&option.value())
+                            .expect("Can't evaluate homeserver");
+
+                    server_ref.settings.borrow_mut().homeserver =
+                        MatrixServer::parse_url_unchecked(&homeserver);
+                });
+
+        server_section
+            .new_string_option(homeserver)
+            .expect("Can't create homeserver option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let proxy = StringOptionSettings::new(format!("{}.proxy", server_name))
+            .set_check_callback(|_, _, value| {
+                MatrixServer::is_url_valid(&value)
+            })
+            .set_change_callback(move |_, option| {
+                let server_ref = server
+                    .upgrade()
+                    .expect("Server got deleted while server config is alive");
+
+                server_ref.settings.borrow_mut().proxy =
+                    MatrixServer::parse_url_unchecked(&option.value());
+            });
+
+        server_section
+            .new_string_option(proxy)
+            .expect("Can't create proxy option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let username =
+            StringOptionSettings::new(format!("{}.username", server_name))
+                .set_change_callback(move |_, option| {
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().username =
+                        Weechat::eval_string_expression(&option.value())
+                            .expect("Can't evaluate username");
+                });
+
+        server_section
+            .new_string_option(username)
+            .expect("Can't create username option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let password =
+            StringOptionSettings::new(format!("{}.password", server_name))
+                .set_change_callback(move |_, option| {
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().password =
+                        Weechat::eval_string_expression(&option.value())
+                            .expect("Can't evaluate password");
+                });
+
+        server_section
+            .new_string_option(password)
+            .expect("Can't create password option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let access_token =
+            StringOptionSettings::new(format!("{}.access_token", server_name))
+                .set_change_callback(move |_, option| {
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().access_token =
+                        Weechat::eval_string_expression(&option.value())
+                            .expect("Can't evaluate access token");
+                });
+
+        server_section
+            .new_string_option(access_token)
+            .expect("Can't create access token option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let refresh_token =
+            StringOptionSettings::new(format!("{}.refresh_token", server_name))
+                .set_change_callback(move |_, option| {
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().refresh_token =
+                        Weechat::eval_string_expression(&option.value())
+                            .expect("Can't evaluate refresh token");
+                });
+
+        server_section
+            .new_string_option(refresh_token)
+            .expect("Can't create refresh token option");
+
+        let server = server_copy;
+        let server_copy = server.clone();
+
+        let device_id =
+            StringOptionSettings::new(format!("{}.device_id", server_name))
+                .set_change_callback(move |_, option| {
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().device_id =
+                        Weechat::eval_string_expression(&option.value())
+                            .expect("Can't evaluate device id");
+                });
+
+        server_section
+            .new_string_option(device_id)
+            .expect("Can't create device id option");
+
+        let server = server_copy;
+
+        let ssl_verify =
+            BooleanOptionSettings::new(format!("{}.ssl_verify", server_name))
+                .default_value(true)
+                .set_change_callback(move |_, option| {
+                    let value = option.value();
+
+                    let server_ref = server.upgrade().expect(
+                        "Server got deleted while server config is alive",
+                    );
+
+                    server_ref.settings.borrow_mut().ssl_verify = value;
+                });
+
+        server_section
+            .new_boolean_option(ssl_verify)
+            .expect("Can't create autoconnect option");
+    }
+}
+
+fn format_join_error(error: &Error, target: &str) -> String {
+    let message = error
+        .as_client_api_error()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| error.to_string());
+
+    if target.starts_with('#')
+        && message.contains("Expected RoomID of the form")
+    {
+        format!(
+            "{message}; the alias may point to a room v12 ID without a server part. Update the homeserver/client stack or join from a homeserver that supports room v12."
+        )
+    } else {
+        message
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum MissingAliasAction {
+    CreateRoom { alias_localpart: String },
+    RefuseForeignAlias,
+    RefuseUnknownAccountDomain,
+}
+
+fn missing_alias_action(
+    alias: &RoomAliasId,
+    account_user_id: Option<&UserId>,
+) -> MissingAliasAction {
+    match account_user_id {
+        Some(user_id) if alias.server_name() == user_id.server_name() => {
+            MissingAliasAction::CreateRoom {
+                alias_localpart: alias.alias().to_owned(),
+            }
+        }
+        Some(_) => MissingAliasAction::RefuseForeignAlias,
+        None => MissingAliasAction::RefuseUnknownAccountDomain,
+    }
+}
+
+fn create_room_request(alias_localpart: String) -> CreateRoomRequest {
+    let mut request = CreateRoomRequest::new();
+    request.room_alias_name = Some(alias_localpart);
+    request
+}
+
+fn room_id_join_servers(room_id: &RoomId) -> Vec<OwnedServerName> {
+    room_id
+        .server_name()
+        .map(|server_name| vec![server_name.to_owned()])
+        .unwrap_or_default()
+}
+
+async fn join_room_or_create_local_alias(
+    client: &Client,
+    room_id_or_alias: &OwnedRoomOrAliasId,
+) -> Result<Room, String> {
+    let Ok(alias) = room_id_or_alias.as_str().parse::<OwnedRoomAliasId>()
+    else {
+        let via = room_id_or_alias
+            .as_str()
+            .parse::<OwnedRoomId>()
+            .map(|room_id| room_id_join_servers(&room_id))
+            .unwrap_or_default();
+
+        return client
+            .join_room_by_id_or_alias(room_id_or_alias, &via)
+            .await
+            .map_err(|error| {
+                format_join_error(&error, room_id_or_alias.as_str())
+            });
+    };
+
+    match client.resolve_room_alias(&alias).await {
+        Ok(response) => {
+            let mut via = response.servers;
+            if let Some(server_name) = response.room_id.server_name() {
+                let server_name = server_name.to_owned();
+                if !via.contains(&server_name) {
+                    via.push(server_name);
+                }
+            }
+
+            client
+                .join_room_by_id_or_alias(room_id_or_alias, &via)
+                .await
+                .map_err(|error| {
+                    format_join_error(&error, room_id_or_alias.as_str())
+                })
+        }
+        Err(error)
+            if error.client_api_error_kind() == Some(&ErrorKind::NotFound) =>
+        {
+            match missing_alias_action(&alias, client.user_id()) {
+                MissingAliasAction::CreateRoom { alias_localpart } => {
+                    // `room_alias_name` makes createRoom register the alias as
+                    // part of room creation, so a failed registration cannot
+                    // leave a newly created, unaliased room behind.
+                    client
+                        .create_room(create_room_request(alias_localpart))
+                        .await
+                        .map_err(|error| {
+                            format!(
+                                "Could not create local room with alias {}: {}",
+                                alias,
+                                format_join_error(&error, alias.as_str())
+                            )
+                        })
+                }
+                MissingAliasAction::RefuseForeignAlias => Err(format!(
+                    "Room alias {} was not found and is not local to your account; refusing to create it.",
+                    alias
+                )),
+                MissingAliasAction::RefuseUnknownAccountDomain => Err(format!(
+                    "Room alias {} was not found, and the account domain is unavailable; refusing to create it.",
+                    alias
+                )),
+            }
+        }
+        Err(error) => {
+            Err(format!("Could not resolve room alias {}: {}", alias, error))
+        }
+    }
+}
+
+impl Drop for MatrixServer {
+    fn drop(&mut self) {
+        // TODO close all the server buffers.
+        // Only free the server config if it's the only clone of the InnerServer
+        if Rc::strong_count(&self.inner) == 1 {
+            let config = &self.config;
+            let mut config_borrow = config.borrow_mut();
+
+            let Some(mut section) = config_borrow.search_section_mut("server")
+            else {
+                error!(
+                    "Can't get server section while dropping Matrix server {}",
+                    self.server_name
+                );
+                return;
+            };
+
+            for option_name in &[
+                "autoconnect",
+                "homeserver",
+                "password",
+                "access_token",
+                "refresh_token",
+                "device_id",
+                "proxy",
+                "ssl_verify",
+                "username",
+            ] {
+                let option_name =
+                    &format!("{}.{}", self.server_name, option_name);
+                if section.free_option(option_name).is_err() {
+                    error!("Can't free option {}", option_name);
+                }
+            }
+        }
+    }
+}
+
+impl InnerServer {
+    pub fn name(&self) -> &str {
+        &self.server_name
+    }
+
+    pub fn rooms(&self) -> Vec<RoomHandle> {
+        self.rooms.borrow().values().cloned().collect()
+    }
+
+    pub(crate) async fn thread_continuation_send_guard(
+        &self,
+    ) -> tokio::sync::MutexGuard<'_, ()> {
+        self.thread_continuation_send_lock.lock().await
+    }
+
+    async fn loaded_thread_continuations(
+        &self,
+    ) -> Result<
+        tokio::sync::MutexGuard<'_, Option<ThreadContinuationState>>,
+        String,
+    > {
+        let connection = self
+            .connection()
+            .ok_or_else(|| "Matrix server is not connected".to_owned())?;
+        let needs_load = self.thread_continuations.lock().await.is_none();
+        if needs_load {
+            let loaded = ThreadContinuationState::load(&connection).await?;
+            let mut state = self.thread_continuations.lock().await;
+            if state.is_none() {
+                *state = Some(loaded);
+            }
+        }
+        Ok(self.thread_continuations.lock().await)
+    }
+
+    async fn joined_room_handle(
+        &self,
+        room_id: &RoomId,
+    ) -> Result<RoomHandle, String> {
+        let connection = self
+            .connection()
+            .ok_or_else(|| "Matrix server is not connected".to_owned())?;
+        let client = connection.client().clone();
+        let room = match client.get_room(room_id) {
+            Some(room) if room.state() == RoomState::Joined => room,
+            _ => connection
+                .join_room_on_runtime(room_id.to_owned())
+                .await
+                .map_err(|error| {
+                    format!(
+                        "failed to join replacement room {room_id}: {error}"
+                    )
+                })?,
+        };
+        if room.state() != RoomState::Joined {
+            return Err(format!("replacement room {room_id} is not joined"));
+        }
+        Ok(self.get_or_create_room(room_id))
+    }
+
+    pub(crate) async fn resolve_thread_route(
+        &self,
+        source_room: &RoomHandle,
+        source_root: &matrix_sdk::ruma::EventId,
+    ) -> Result<ThreadRoute, String> {
+        let source = ThreadKey::new(source_room.room_id(), source_root);
+        let effective_source = self
+            .loaded_thread_continuations()
+            .await?
+            .as_ref()
+            .expect("continuation state was loaded")
+            .resolve(&source)?
+            .unwrap_or(source);
+
+        let client = self
+            .get_client()
+            .ok_or_else(|| "Matrix server is not connected".to_owned())?;
+        let effective_room = if effective_source.room_id
+            == source_room.room_id()
+            && effective_source.thread_root == source_root
+        {
+            source_room.clone()
+        } else {
+            self.joined_room_handle(&effective_source.room_id).await?
+        };
+        let mut current = effective_room.room();
+        let mut visited = HashSet::from([current.room_id().to_owned()]);
+        let mut upgraded = false;
+
+        for _ in 0..32 {
+            let Some(successor) = current.successor_room() else {
+                return if upgraded {
+                    Ok(ThreadRoute::CreateRoot {
+                        room: self
+                            .joined_room_handle(current.room_id())
+                            .await?,
+                        continuation_source: effective_source,
+                    })
+                } else {
+                    Ok(ThreadRoute::Current {
+                        room: effective_room,
+                        thread_root: effective_source.thread_root,
+                    })
+                };
+            };
+            if !visited.insert(successor.room_id.clone()) {
+                return Err("cyclic Matrix room upgrade chain".to_owned());
+            }
+            current = match client.get_room(&successor.room_id) {
+                Some(room) if room.state() == RoomState::Joined => room,
+                _ => self.joined_room_handle(&successor.room_id).await?.room(),
+            };
+            upgraded = true;
+        }
+
+        Err("Matrix room upgrade chain is too deep".to_owned())
+    }
+
+    pub(crate) async fn persist_thread_continuation(
+        &self,
+        source: ThreadKey,
+        target: ThreadKey,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection()
+            .ok_or_else(|| "Matrix server is not connected".to_owned())?;
+        let mut state_guard = self.loaded_thread_continuations().await?;
+        let (previous, next) = {
+            let state = state_guard.as_mut().ok_or_else(|| {
+                "continuation state failed to load".to_owned()
+            })?;
+            let previous = state.clone();
+            state.insert(source, target)?;
+            (previous, state.clone())
+        };
+        drop(state_guard);
+        if let Err(error) = next.save(&connection).await {
+            let mut state = self.thread_continuations.lock().await;
+            *state = Some(previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn verify_thread_continuation_store(
+        &self,
+    ) -> Result<(), String> {
+        let connection = self
+            .connection()
+            .ok_or_else(|| "Matrix server is not connected".to_owned())?;
+        let state_guard = self.loaded_thread_continuations().await?;
+        let state = state_guard
+            .as_ref()
+            .ok_or_else(|| "continuation state failed to load".to_owned())?
+            .clone();
+        drop(state_guard);
+        state.save(&connection).await
+    }
+
+    pub fn verifications(&self) -> Vec<VerificationBuffer> {
+        self.verification_buffers
+            .borrow()
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn get_or_create_room(&self, room_id: &RoomId) -> RoomHandle {
+        if !self.rooms.borrow().contains_key(room_id) {
+            let homeserver = self
+                .settings
+                .borrow()
+                .homeserver
+                .clone()
+                .expect("Creating room buffer while no homeserver");
+            let login_state = self.login_state.borrow();
+            let login_state = login_state
+                .as_ref()
+                .expect("Receiving events while not being logged in");
+            let client = self.client.borrow();
+            let room = client
+                .as_ref()
+                .expect("Receiving events without a client")
+                .get_room(room_id);
+
+            let room = room.unwrap_or_else(|| {
+                panic!(
+                    "Receiving events for a room while no room found {}",
+                    room_id
+                )
+            });
+            let buffer = RoomHandle::new(
+                &self.server_name,
+                self.servers.runtime().to_owned(),
+                self.self_weak.borrow().clone(),
+                &self.connection,
+                self.config.inner.clone(),
+                room,
+                homeserver,
+                room_id,
+                &login_state.user_id,
+            );
+            self.rooms.borrow_mut().insert(room_id.to_owned(), buffer);
+
+            for room in self.rooms() {
+                room.refresh_space_children();
+            }
+        }
+
+        self.rooms.borrow().get(room_id).cloned().unwrap()
+    }
+
+    pub fn config(&self) -> ConfigHandle {
+        self.config.clone()
+    }
+
+    pub fn user_name(&self) -> String {
+        self.settings.borrow().username.clone()
+    }
+
+    pub fn password(&self) -> String {
+        self.settings.borrow().password.clone()
+    }
+
+    pub fn access_token(&self) -> String {
+        self.settings.borrow().access_token.clone()
+    }
+
+    pub fn refresh_token(&self) -> String {
+        self.settings.borrow().refresh_token.clone()
+    }
+
+    pub fn device_id(&self) -> String {
+        self.settings.borrow().device_id.clone()
+    }
+
+    pub fn user_id_domain(&self) -> Option<String> {
+        if let Some(login_state) = self.login_state.borrow().as_ref() {
+            return Some(login_state.user_id.server_name().as_str().to_owned());
+        }
+
+        self.settings
+            .borrow()
+            .homeserver
+            .as_ref()
+            .and_then(|url| url.host_str().map(str::to_owned))
+    }
+
+    /// Set the display name for this account on the homeserver.
+    pub async fn set_display_name(&self, name: Option<&str>) {
+        let Some(connection) = self.connection() else {
+            self.print_error("Not connected to a server");
+            return;
+        };
+
+        let client = connection.client().clone();
+        let name = name.map(str::to_owned);
+        let result = connection
+            .spawn(async move {
+                client.account().set_display_name(name.as_deref()).await
+            })
+            .await;
+
+        if let Err(e) = result {
+            self.print_error(&format!("Failed to set display name: {}", e));
+        }
+    }
+
+    /// Get the current display name for this account from the homeserver.
+    pub async fn get_display_name(&self) -> Option<String> {
+        let connection = self.connection()?;
+        let client = connection.client().clone();
+
+        connection
+            .spawn(async move { client.account().get_display_name().await })
+            .await
+            .ok()
+            .flatten()
+    }
+
+    pub async fn restore_room_by_id(&self, room_id: OwnedRoomId) {
+        if self.rooms.borrow().contains_key(&room_id) {
+            return;
+        }
+
+        let Some(client) = self.get_client() else {
+            return;
+        };
+
+        let Some(room) = client.get_room(&room_id) else {
+            error!("Can't restore room {}, room not found", room_id);
+            return;
+        };
+
+        self.restore_room(room).await;
+    }
+
+    fn room_buffer_is_current(room: &RoomHandle) -> bool {
+        room.buffer_handle()
+            .upgrade()
+            .map(|buffer| {
+                // Sync callbacks run on WeeChat's main thread, so the global
+                // context is valid for this immediate buffer comparison.
+                buffer == unsafe { Weechat::weechat() }.current_buffer()
+            })
+            .unwrap_or(false)
+    }
+
+    async fn successor_room_handle(
+        &self,
+        room_id: OwnedRoomId,
+    ) -> Option<RoomHandle> {
+        if let Some(room) = self.rooms.borrow().get(&room_id).cloned() {
+            return Some(room);
+        }
+
+        let client_room = if let Some(room) = self
+            .get_client()
+            .and_then(|client| client.get_room(&room_id))
+        {
+            Some(room)
+        } else {
+            let Some(connection) = self.connection() else {
+                self.print_error(&format!(
+                    "Room was upgraded to {room_id}, but Matrix is not connected."
+                ));
+                return None;
+            };
+            let client = connection.client().clone();
+            let target = room_id.clone();
+            let room_id_or_alias: OwnedRoomOrAliasId =
+                room_id.as_str().parse().expect("valid Matrix room ID");
+            match connection
+                .spawn(async move {
+                    tokio::time::timeout(JOIN_ROOM_TIMEOUT, async move {
+                        let via = room_id_join_servers(&target);
+                        client
+                            .join_room_by_id_or_alias(&room_id_or_alias, &via)
+                            .await
+                    })
+                    .await
+                })
+                .await
+            {
+                Ok(Ok(room)) => Some(room),
+                Ok(Err(error)) => {
+                    self.print_error(&format!(
+                        "Failed to join upgraded room {room_id}: {error}"
+                    ));
+                    None
+                }
+                Err(error) => {
+                    self.print_error(&format!(
+                        "Timed out joining upgraded room {room_id} after {} seconds: {error}",
+                        JOIN_ROOM_TIMEOUT.as_secs()
+                    ));
+                    None
+                }
+            }
+        };
+
+        if let Some(room) = client_room {
+            self.restore_room(room).await;
+        }
+
+        self.rooms.borrow().get(&room_id).cloned()
+    }
+
+    async fn latest_successor_room_handle(
+        &self,
+        room_id: OwnedRoomId,
+    ) -> Option<RoomHandle> {
+        let mut next_room_id = room_id;
+        let mut seen_room_ids = HashSet::new();
+
+        for _ in 0..ROOM_UPGRADE_CHAIN_LIMIT {
+            if !seen_room_ids.insert(next_room_id.clone()) {
+                self.print_error(&format!(
+                    "Room upgrade cycle detected at {next_room_id}."
+                ));
+                return None;
+            }
+
+            let room = self.successor_room_handle(next_room_id).await?;
+            let Some(successor_room_id) = room
+                .room()
+                .successor_room()
+                .map(|successor| successor.room_id)
+            else {
+                return Some(room);
+            };
+            next_room_id = successor_room_id;
+        }
+
+        self.print_error(&format!(
+            "Room upgrade chain exceeded {ROOM_UPGRADE_CHAIN_LIMIT} rooms."
+        ));
+        None
+    }
+
+    async fn switch_current_room_to_successor(
+        &self,
+        current_room: &RoomHandle,
+        successor_room_id: OwnedRoomId,
+    ) {
+        if !Self::room_buffer_is_current(current_room) {
+            return;
+        }
+
+        let Some(successor) =
+            self.latest_successor_room_handle(successor_room_id).await
+        else {
+            return;
+        };
+        if let Ok(buffer) = successor.buffer_handle().upgrade() {
+            buffer.switch_to();
+        }
+    }
+
+    async fn latest_room_for(&self, room: &RoomHandle) -> RoomHandle {
+        let Some(successor_room_id) = room
+            .room()
+            .successor_room()
+            .map(|successor| successor.room_id)
+        else {
+            return room.clone();
+        };
+
+        self.latest_successor_room_handle(successor_room_id)
+            .await
+            .unwrap_or_else(|| room.clone())
+    }
+
+    fn latest_restored_successor_room(
+        &self,
+        room: &RoomHandle,
+    ) -> Option<RoomHandle> {
+        let mut next_room_id = room
+            .room()
+            .successor_room()
+            .map(|successor| successor.room_id)?;
+        let mut seen_room_ids = HashSet::new();
+        let mut latest = None;
+
+        for _ in 0..ROOM_UPGRADE_CHAIN_LIMIT {
+            if !seen_room_ids.insert(next_room_id.clone()) {
+                self.print_error(&format!(
+                    "Room upgrade cycle detected at {next_room_id}."
+                ));
+                return None;
+            }
+
+            let Some(room) = self.rooms.borrow().get(&next_room_id).cloned()
+            else {
+                return latest;
+            };
+            next_room_id = match room
+                .room()
+                .successor_room()
+                .map(|successor| successor.room_id)
+            {
+                Some(successor_room_id) => successor_room_id,
+                None => return Some(room),
+            };
+            latest = Some(room);
+        }
+
+        self.print_error(&format!(
+            "Room upgrade chain exceeded {ROOM_UPGRADE_CHAIN_LIMIT} rooms."
+        ));
+        latest
+    }
+
+    fn switch_current_room_to_restored_successor(
+        &self,
+        current_room: &RoomHandle,
+        successor_room: &RoomHandle,
+    ) {
+        if !Self::room_buffer_is_current(current_room) {
+            return;
+        }
+
+        if let Ok(buffer) = successor_room.buffer_handle().upgrade() {
+            buffer.switch_to();
+        }
+    }
+
+    fn switch_restored_upgrade_chain(&self, restored_room: &RoomHandle) {
+        if let Some(successor_room) =
+            self.latest_restored_successor_room(restored_room)
+        {
+            self.switch_current_room_to_restored_successor(
+                restored_room,
+                &successor_room,
+            );
+        }
+
+        let restored_room_id = restored_room.room_id().to_owned();
+        let rooms = self.rooms.borrow().values().cloned().collect::<Vec<_>>();
+        for room in rooms {
+            if room.room_id() == restored_room_id {
+                continue;
+            }
+
+            let Some(successor_room_id) = room
+                .room()
+                .successor_room()
+                .map(|successor| successor.room_id)
+            else {
+                continue;
+            };
+
+            if successor_room_id == restored_room_id {
+                let successor_room = self
+                    .latest_restored_successor_room(&room)
+                    .unwrap_or_else(|| restored_room.clone());
+                self.switch_current_room_to_restored_successor(
+                    &room,
+                    &successor_room,
+                );
+            }
+        }
+    }
+
+    pub async fn restore_room(&self, room: Room) {
+        let homeserver = self
+            .settings
+            .borrow()
+            .homeserver
+            .clone()
+            .expect("Creating room buffer while no homeserver");
+
+        match RoomHandle::restore(
+            &self.server_name,
+            self.servers.runtime().to_owned(),
+            self.self_weak.borrow().clone(),
+            room,
+            &self.connection,
+            self.config.inner.clone(),
+            homeserver,
+        )
+        .await
+        {
+            Ok(buffer) => {
+                let room_id = buffer.room_id().to_owned();
+
+                self.rooms.borrow_mut().insert(room_id, buffer.clone());
+                if let Some((is_direct, display_name)) = self
+                    .pending_room_metadata
+                    .borrow_mut()
+                    .remove(buffer.room_id())
+                {
+                    buffer.apply_room_metadata(is_direct, display_name);
+                }
+                self.switch_restored_upgrade_chain(&buffer);
+
+                // Relay-native frontends select buffers without triggering
+                // WeeChat's buffer_switch signal. Populate restored Matrix
+                // buffers proactively instead of waiting for a TUI-only hook.
+                Weechat::spawn(async move {
+                    buffer.preload_restored_messages().await;
+                    buffer.recover_logged_encrypted_events().await;
+                })
+                .detach();
+            }
+            Err(e) => self.print_error(&format!("Error restoring room: {}", e)),
+        }
+    }
+
+    pub async fn get_or_create_dm(
+        &self,
+        user_id: OwnedUserId,
+    ) -> Option<RoomHandle> {
+        let Some(connection) = self.connection() else {
+            self.print_error("Not connected. Please connect first.");
+            return None;
+        };
+
+        let client = connection.client().clone();
+        let target = user_id.clone();
+        let room = connection
+            .spawn(async move {
+                if let Some(room) = client.get_dm_room(&target) {
+                    Ok(room)
+                } else {
+                    client.create_dm(&target).await
+                }
+            })
+            .await;
+
+        let room = match room {
+            Ok(room) => room,
+            Err(error) => {
+                self.print_error(&format!(
+                    "Failed to open direct message with {}: {}",
+                    user_id, error
+                ));
+                return None;
+            }
+        };
+
+        let room_id = room.room_id().to_owned();
+        if !self.rooms.borrow().contains_key(&room_id) {
+            self.restore_room(room).await;
+        }
+
+        self.rooms.borrow().get(&room_id).cloned()
+    }
+
+    fn create_server_buffer(&self) -> BufferHandle {
+        let buffer_handle =
+            BufferBuilder::new(&format!("server.{}", self.server_name))
+                .build()
+                .expect("Can't create Matrix debug buffer");
+
+        let buffer = buffer_handle
+            .upgrade()
+            .expect("Can't upgrade newly created server buffer");
+
+        let settings = self.settings.borrow();
+
+        buffer.set_title(&format!(
+            "Matrix: {}",
+            settings
+                .homeserver
+                .as_ref()
+                .map(|u| u.to_string())
+                .unwrap_or_else(|| self.server_name.to_string()),
+        ));
+        buffer.set_short_name(&self.server_name);
+        buffer.set_localvar("type", "server");
+        buffer.set_localvar("nick", &settings.username);
+        buffer.set_localvar("server", &self.server_name);
+
+        self.merge_server_buffer(&buffer);
+
+        buffer_handle
+    }
+
+    fn merge_server_buffer(&self, buffer: &Buffer) {
+        match self.config.borrow().look().server_buffer() {
+            ServerBuffer::MergeWithCore => {
+                buffer.unmerge();
+
+                let core_buffer = buffer.core_buffer();
+                buffer.merge(&core_buffer);
+            }
+            ServerBuffer::Independent => buffer.unmerge(),
+            ServerBuffer::MergeWithoutCore => {
+                let servers = self.servers.borrow();
+
+                let server = if let Some(server) = servers.values().next() {
+                    server
+                } else {
+                    return;
+                };
+
+                if server.name() == &*self.server_name {
+                    buffer.unmerge();
+                } else {
+                    let inner = server.inner();
+
+                    if let Some(Ok(other_buffer)) =
+                        inner.server_buffer().as_ref().map(|b| b.upgrade())
+                    {
+                        let core_buffer = buffer.core_buffer();
+
+                        buffer.unmerge_to((core_buffer.number() + 1) as u16);
+                        buffer.merge(&other_buffer);
+                    };
+                }
+            }
+        }
+    }
+
+    fn get_client(&self) -> Option<Client> {
+        self.client.borrow().clone()
+    }
+
+    fn get_or_create_client(&self) -> Result<Client, ServerError> {
+        let client = if let Some(c) = self.get_client() {
+            c
+        } else {
+            self.create_client()?
+        };
+
+        // Check if the homeserver setting changed and swap our client if it
+        // did.
+        if *self.current_settings.borrow() != *self.settings.borrow() {
+            // TODO if the homeserver changed close all the room buffers of the
+            // server here, they don't belong to our client anymore.
+            self.create_client()
+        } else {
+            Ok(client)
+        }
+    }
+
+    /// Borrow the server buffer handle.
+    pub fn server_buffer(&self) -> Ref<'_, Option<BufferHandle>> {
+        self.server_buffer.borrow()
+    }
+
+    fn get_or_create_buffer<'a>(
+        &self,
+        server_buffer: &'a mut RefMut<Option<BufferHandle>>,
+    ) -> &'a BufferHandle {
+        if let Some(buffer) = server_buffer.as_ref() {
+            if buffer.upgrade().is_err() {
+                let buffer = self.create_server_buffer();
+                **server_buffer = Some(buffer);
+            }
+        } else {
+            let buffer = self.create_server_buffer();
+            **server_buffer = Some(buffer);
+        }
+
+        server_buffer.as_ref().unwrap()
+    }
+
+    /// Print a neutral message to the server buffer.
+    fn print(&self, message: &str) {
+        let mut server_buffer = self.server_buffer.borrow_mut();
+        let buffer = self
+            .get_or_create_buffer(&mut server_buffer)
+            .upgrade()
+            .unwrap();
+        buffer.print(message);
+    }
+
+    /// Print a message with a given prefix to the server buffer.
+    pub fn print_with_prefix(&self, prefix: &str, message: &str) {
+        self.print(&format!("{}{}: {}", prefix, PLUGIN_NAME, message));
+    }
+
+    /// Print a message to a Matrix buffer, falling back to the server buffer if
+    /// the original command buffer disappeared.
+    fn print_with_prefix_to(
+        &self,
+        buffer: Option<&BufferHandle>,
+        prefix: &str,
+        message: &str,
+    ) {
+        if let Some(Ok(buffer)) = buffer.map(|buffer| buffer.upgrade()) {
+            buffer.print(&format!("{}{}: {}", prefix, PLUGIN_NAME, message));
+        } else {
+            self.print_with_prefix(prefix, message);
+        }
+    }
+
+    /// Print an network message to the server buffer.
+    pub fn print_network(&self, message: &str) {
+        self.print_with_prefix(&Weechat::prefix(Prefix::Network), message);
+    }
+
+    /// Print an error message to the server buffer.
+    pub fn print_error(&self, message: &str) {
+        self.print_with_prefix(&Weechat::prefix(Prefix::Error), message);
+    }
+
+    /// Is the server connected.
+    pub fn connected(&self) -> bool {
+        self.connection.borrow().is_some()
+    }
+
+    pub async fn receive_to_device_event(&self, event: AnyToDeviceEvent) {
+        let handle_event = |event, transaction_id: String| async move {
+            if let Some(b) =
+                self.verification_buffers.borrow().get(&transaction_id)
+            {
+                b.handle_event(event).await;
+            }
+        };
+
+        let mut refresh_status_bar = false;
+
+        match &event {
+            AnyToDeviceEvent::RoomKey(e) => {
+                if let Some(room) =
+                    self.rooms.borrow().get(&e.content.room_id).cloned()
+                {
+                    room.retry_pending_encrypted_events_for_session(
+                        &e.content.room_id,
+                        &e.content.session_id,
+                    )
+                    .await;
+                }
+            }
+            AnyToDeviceEvent::ForwardedRoomKey(e) => {
+                if let Some(room) =
+                    self.rooms.borrow().get(&e.content.room_id).cloned()
+                {
+                    room.retry_pending_encrypted_events_for_session(
+                        &e.content.room_id,
+                        &e.content.session_id,
+                    )
+                    .await;
+                }
+            }
+            AnyToDeviceEvent::RoomKeyRequest(_) => {}
+            AnyToDeviceEvent::RoomKeyWithheld(e) => {
+                use matrix_sdk::ruma::events::room_key::withheld::{
+                    RoomKeyWithheldCodeInfo, RoomKeyWithheldSessionData,
+                };
+
+                // The sender's client proactively told us it will not share
+                // the room key. Surface an actionable hint, routed to the
+                // room buffer when we know which room the key belongs to.
+                // Each recognized code gets its own remediation; the raw
+                // reason is only shown when the code is unknown, as ruma
+                // documents `reason` as a fallback for unrecognized codes.
+                let code = &e.content.code;
+                let session_data: Option<&RoomKeyWithheldSessionData> =
+                    match code {
+                        RoomKeyWithheldCodeInfo::Blacklisted(data) => {
+                            Some(data)
+                        }
+                        RoomKeyWithheldCodeInfo::Unverified(data) => Some(data),
+                        RoomKeyWithheldCodeInfo::Unauthorized(data) => {
+                            Some(data)
+                        }
+                        RoomKeyWithheldCodeInfo::Unavailable(data) => {
+                            Some(data)
+                        }
+                        RoomKeyWithheldCodeInfo::NoOlm => None,
+                        _ => None,
+                    };
+
+                let login_state = self.login_state.borrow();
+                let own_user_id =
+                    login_state.as_ref().map(|state| state.user_id.as_ref());
+                let message = room_key_withheld_message(
+                    code,
+                    &e.sender,
+                    own_user_id,
+                    e.content.reason.as_deref(),
+                );
+
+                let buffer = session_data.and_then(|data| {
+                    self.rooms
+                        .borrow()
+                        .get(&data.room_id)
+                        .map(|room| room.buffer_handle())
+                });
+                self.print_with_prefix_to(
+                    buffer.as_ref(),
+                    &Weechat::prefix(Prefix::Network),
+                    &message,
+                );
+            }
+            AnyToDeviceEvent::KeyVerificationRequest(e) => {
+                refresh_status_bar = true;
+                if let Some(client) = self.get_client() {
+                    if let Some(request) = client
+                        .encryption()
+                        .get_verification_request(
+                            &e.sender,
+                            &e.content.transaction_id,
+                        )
+                        .await
+                    {
+                        let buffer = VerificationBuffer::new(
+                            &self.server_name,
+                            &e.sender,
+                            request,
+                            self.connection.clone(),
+                        );
+                        buffer.handle_event(&event).await;
+                        self.verification_buffers.borrow_mut().insert(
+                            e.content.transaction_id.to_string(),
+                            buffer,
+                        );
+                    }
+                }
+            }
+            AnyToDeviceEvent::KeyVerificationStart(e) => {
+                refresh_status_bar = true;
+                if let Some(client) = self.get_client() {
+                    use matrix_sdk::encryption::verification::Verification;
+                    match client
+                        .encryption()
+                        .get_verification(
+                            &e.sender,
+                            e.content.transaction_id.as_str(),
+                        )
+                        .await
+                    {
+                        Some(Verification::SasV1(sas)) => {
+                            if !sas.is_cancelled() {
+                                let buffer = self
+                                    .verification_buffers
+                                    .borrow()
+                                    .get(e.content.transaction_id.as_str())
+                                    .cloned();
+
+                                if let Some(mut buffer) = buffer {
+                                    let _ = buffer.update(sas).await;
+                                    buffer.handle_event(&event).await;
+                                } else {
+                                    let buffer = VerificationBuffer::new(
+                                        &self.server_name,
+                                        &e.sender,
+                                        sas,
+                                        self.connection.clone(),
+                                    );
+                                    buffer.handle_event(&event).await;
+                                    self.verification_buffers
+                                        .borrow_mut()
+                                        .insert(
+                                            e.content
+                                                .transaction_id
+                                                .to_string(),
+                                            buffer,
+                                        );
+                                }
+                            }
+                        }
+                        Some(Verification::QrV1(qr)) => {
+                            if let Some(buffer) = self
+                                .verification_buffers
+                                .borrow_mut()
+                                .get_mut(e.content.transaction_id.as_str())
+                            {
+                                buffer.update_qr(qr).await;
+                                buffer.handle_event(&event).await;
+                            }
+                        }
+                        Some(_) => unreachable!(),
+                        None => todo!(),
+                    }
+                }
+            }
+            AnyToDeviceEvent::KeyVerificationCancel(e) => {
+                refresh_status_bar = true;
+                handle_event(&event, e.content.transaction_id.to_string())
+                    .await;
+            }
+            AnyToDeviceEvent::KeyVerificationAccept(e) => {
+                refresh_status_bar = true;
+                handle_event(&event, e.content.transaction_id.to_string()).await
+            }
+            AnyToDeviceEvent::KeyVerificationKey(e) => {
+                refresh_status_bar = true;
+                handle_event(&event, e.content.transaction_id.to_string()).await
+            }
+            AnyToDeviceEvent::KeyVerificationMac(e) => {
+                refresh_status_bar = true;
+                handle_event(&event, e.content.transaction_id.to_string()).await
+            }
+            AnyToDeviceEvent::KeyVerificationDone(e) => {
+                refresh_status_bar = true;
+                handle_event(&event, e.content.transaction_id.to_string()).await
+            }
+            _ => {}
+        }
+
+        if refresh_status_bar {
+            Weechat::bar_item_update("buffer_modes");
+        }
+    }
+
+    pub async fn receive_member(
+        &self,
+        room_id: OwnedRoomId,
+        member: SyncStateEvent<RoomMemberEventContent>,
+        is_state: bool,
+        ambiguity_change: Option<AmbiguityChange>,
+    ) {
+        let room = self.rooms.borrow().get(&room_id).cloned();
+
+        if let Some(room) = room {
+            room.handle_membership_event(
+                &member,
+                is_state,
+                ambiguity_change.as_ref(),
+            )
+            .await;
+        } else {
+            error!("Room with id {} not found.", room_id);
+        }
+    }
+
+    pub async fn receive_joined_state_event(
+        &self,
+        room_id: &RoomId,
+        event: AnySyncStateEvent,
+    ) {
+        let refresh_parent_spaces =
+            matches!(&event, AnySyncStateEvent::RoomName(_));
+        let successor_room_id = match &event {
+            AnySyncStateEvent::RoomTombstone(tombstone) => {
+                tombstone_replacement_room_id(tombstone)
+            }
+            _ => None,
+        };
+        let room = self.get_or_create_room(room_id);
+        room.handle_sync_state_event(&event, true).await;
+
+        if let Some(successor_room_id) = successor_room_id {
+            self.switch_current_room_to_successor(&room, successor_room_id)
+                .await;
+        }
+
+        if refresh_parent_spaces {
+            for room in self.rooms() {
+                room.update_parent_spaces();
+                room.refresh_space_children();
+            }
+        }
+    }
+
+    pub async fn receive_joined_timeline_event(
+        &self,
+        room_id: &RoomId,
+        event: AnySyncTimelineEvent,
+    ) {
+        let room = self.get_or_create_room(room_id);
+        room.handle_sync_room_event(event).await
+    }
+
+    pub async fn receive_joined_ephemeral_event(
+        &self,
+        room_id: &RoomId,
+        event: AnySyncEphemeralRoomEvent,
+    ) {
+        let room = self.get_or_create_room(room_id);
+        room.handle_sync_ephemeral_event(event).await
+    }
+
+    pub fn receive_login(&self, response: LoginResponse) {
+        let login_state = LoginInfo {
+            user_id: response.user_id,
+        };
+
+        *self.login_state.borrow_mut() = Some(login_state);
+    }
+
+    pub fn receive_restored_login(&self, user_id: OwnedUserId) {
+        *self.login_state.borrow_mut() = Some(LoginInfo { user_id });
+        self.print_network(&format!(
+            "Restored Element session for {}{}{}",
+            Weechat::color("chat_server"),
+            self.name(),
+            Weechat::color("reset"),
+        ));
+    }
+
+    pub fn receive_session_tokens(&self, tokens: SessionTokens) {
+        let secure_prefix: String = self
+            .server_name
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let access_name = format!("{secure_prefix}_access_token");
+        let refresh_name = format!("{secure_prefix}_refresh_token");
+
+        let buffer_handle = {
+            let mut server_buffer = self.server_buffer.borrow_mut();
+            self.get_or_create_buffer(&mut server_buffer).clone()
+        };
+        let Ok(buffer) = buffer_handle.upgrade() else {
+            self.print_error("Unable to persist refreshed Matrix session");
+            return;
+        };
+
+        let Some(access_command) =
+            secure_set_token_command(&access_name, &tokens.access_token)
+        else {
+            self.print_error(
+                "Refusing to persist an invalid Matrix access token",
+            );
+            return;
+        };
+
+        let commands = [
+            access_command,
+            format!(
+                "/set matrix-rust.server.{}.access_token \
+                 \"${{sec.data.{access_name}}}\"",
+                self.server_name
+            ),
+        ];
+
+        for command in commands {
+            if buffer.run_command(&command).is_err() {
+                self.print_error(
+                    "Unable to persist refreshed Matrix access token",
+                );
+                return;
+            }
+        }
+
+        if let Some(refresh_token) = tokens.refresh_token {
+            let Some(refresh_command) =
+                secure_set_token_command(&refresh_name, &refresh_token)
+            else {
+                self.print_error(
+                    "Refusing to persist an invalid Matrix refresh token",
+                );
+                return;
+            };
+
+            let commands = [
+                refresh_command,
+                format!(
+                    "/set matrix-rust.server.{}.refresh_token \
+                     \"${{sec.data.{refresh_name}}}\"",
+                    self.server_name
+                ),
+            ];
+
+            for command in commands {
+                if buffer.run_command(&command).is_err() {
+                    self.print_error(
+                        "Unable to persist refreshed Matrix refresh token",
+                    );
+                    return;
+                }
+            }
+        }
+
+        if buffer.run_command("/save sec").is_err()
+            || buffer.run_command("/save matrix-rust").is_err()
+        {
+            self.print_error("Unable to save refreshed Matrix session");
+            return;
+        }
+
+        self.print_network("Persisted refreshed Matrix session");
+    }
+
+    pub fn receive_room_metadata(
+        &self,
+        room_id: OwnedRoomId,
+        is_direct: bool,
+        display_name: Option<String>,
+    ) {
+        if let Some(room) = self.rooms.borrow().get(&room_id) {
+            room.apply_room_metadata(is_direct, display_name);
+        } else {
+            self.pending_room_metadata
+                .borrow_mut()
+                .insert(room_id, (is_direct, display_name));
+        }
+    }
+
+    pub fn receive_sso_url(&self, url: &str) {
+        self.print_network(&format!(
+            "Open this URL to finish SSO login for {}{}{}: {}",
+            Weechat::color("chat_server"),
+            self.name(),
+            Weechat::color("reset"),
+            url,
+        ));
+    }
+
+    fn create_server_dir(&self) -> std::io::Result<()> {
+        let path = self.get_server_path();
+        std::fs::create_dir_all(path)
+    }
+
+    pub fn get_server_path(&self) -> PathBuf {
+        let mut path = Weechat::home_dir();
+        let server_name: &str = &self.server_name;
+        path.push("matrix-rust");
+        path.push(server_name);
+
+        path
+    }
+
+    fn get_server_cache_path(&self) -> PathBuf {
+        let mut path = Weechat::home_dir();
+        let server_name: &str = &self.server_name;
+        path.push("matrix-rust");
+        path.push(format!("{}-cache", server_name));
+
+        path
+    }
+
+    pub fn connection(&self) -> Option<Connection> {
+        self.connection.borrow().clone()
+    }
+
+    fn set_connection(&self, connection: Connection) {
+        *self.connection.borrow_mut() = Some(connection);
+    }
+
+    pub fn create_client(&self) -> Result<Client, ServerError> {
+        let settings = self.settings.borrow();
+
+        let homeserver = settings.homeserver.as_ref().ok_or_else(|| {
+            ServerError::StartError("Homeserver not configured".to_owned())
+        })?;
+
+        self.create_server_dir().map_err(|e| {
+            ServerError::IoError(format!(
+                "Error creating the session dir: {}",
+                e
+            ))
+        })?;
+
+        let mut client_builder = Client::builder()
+            .homeserver_url(homeserver)
+            .handle_refresh_tokens()
+            .sqlite_store_with_cache_path(
+                self.get_server_path(),
+                self.get_server_cache_path(),
+                Some("DEFAULT_PASSPHRASE"),
+            );
+
+        if let Some(proxy) = settings.proxy.as_ref() {
+            client_builder = client_builder.proxy(proxy);
+        }
+
+        if !settings.ssl_verify {
+            client_builder = client_builder.disable_ssl_verification();
+        }
+
+        let client: Client = self
+            .servers
+            .runtime()
+            .block_on(client_builder.build())
+            .map_err(ServerError::ClientError)?;
+
+        *self.current_settings.borrow_mut() = settings.clone();
+        *self.client.borrow_mut() = Some(client.clone());
+
+        Ok(client)
+    }
+
+    pub async fn delete_devices(&self, devices: Vec<OwnedDeviceId>) {
+        let formatted = devices
+            .iter()
+            .map(|d| d.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        let print_success = || {
+            self.print_network(&format!(
+                "Successfully deleted device(s) {}",
+                formatted
+            ));
+        };
+
+        let print_fail = |e| {
+            self.print_error(&format!(
+                "Error deleting device(s) {} {:#?}",
+                formatted, e
+            ));
+        };
+
+        if let Some(c) = self.connection() {
+            let delete = |auth_info| async {
+                c.delete_devices(devices.clone(), auth_info)
+                    .await
+                    .map(|_| ())
+            };
+
+            match delete(None).await {
+                Ok(_) => print_success(),
+                Err(e) => {
+                    if let Some(info) = e.as_uiaa_response() {
+                        let auth_info = {
+                            let settings = self.settings.borrow();
+                            InteractiveAuthInfo {
+                                user: settings.username.clone(),
+                                password: settings.password.clone(),
+                                session: info.session.clone(),
+                            }
+                        };
+
+                        if let Err(e) = delete(Some(auth_info)).await {
+                            print_fail(e);
+                        } else {
+                            print_success();
+                        }
+                    } else {
+                        print_fail(e)
+                    }
+                }
+            }
+        };
+    }
+
+    pub async fn export_keys(
+        &self,
+        file: PathBuf,
+        passphrase: String,
+        room_id: Option<OwnedRoomId>,
+    ) {
+        let Some(client) = self.get_client() else {
+            self.print_error("Can't export E2EE keys while disconnected");
+            return;
+        };
+        let success_message = room_id.as_ref().map_or_else(
+            || "Successfully exported E2EE keys".to_owned(),
+            |room_id| {
+                format!(
+                    "Exported E2EE keys matching room {room_id}; the Matrix SDK does not report whether any sessions matched"
+                )
+            },
+        );
+
+        let export = async move {
+            client
+                .encryption()
+                .export_room_keys(file, &passphrase, |session| {
+                    room_id.as_ref().map_or(true, |room_id| {
+                        session.room_id().as_str() == room_id.as_str()
+                    })
+                })
+                .await
+        };
+
+        if let Some(c) = self.connection() {
+            if let Err(e) = c.spawn(export).await {
+                self.print_error(&format!(
+                    "Error exporting E2EE keys {:#?}",
+                    e
+                ));
+            } else {
+                self.print_network(&success_message)
+            }
+        } else {
+            self.print_error("Can't export E2EE keys while disconnected");
+        }
+    }
+
+    pub async fn import_keys(&self, file: PathBuf, passphrase: String) {
+        let client = self.get_client().unwrap();
+
+        if let Some(c) = self.connection() {
+            self.print_network(&format!(
+                "Importing E2EE keys from {}, this may take a while..",
+                file.display()
+            ));
+            let import = async move {
+                client
+                    .encryption()
+                    .import_room_keys(file, &passphrase)
+                    .await
+            };
+
+            match c.spawn(import).await {
+                Ok(RoomKeyImportResult {
+                    imported_count,
+                    total_count,
+                    ..
+                }) => {
+                    // Even a deduplicated import can make an already-present
+                    // key usable for placeholders recovered in this session.
+                    for room in self.rooms() {
+                        room.retry_all_pending_encrypted_events().await;
+                    }
+
+                    if imported_count > 0 {
+                        self.print_network(&format!(
+                            "Successfully imported {} E2EE keys",
+                            imported_count
+                        ));
+                    } else if total_count > 0 {
+                        self.print_network(
+                            "No keys were imported, the key export contains only \
+                            keys that we already have",
+                        );
+                    } else {
+                        self.print_network(
+                            "No keys were imported, either the key export is empty"
+                        );
+                    }
+                }
+                Err(e) => {
+                    self.print_error(&format!(
+                        "Error importing E2EE keys {:#?}",
+                        e
+                    ));
+                }
+            }
+        };
+    }
+
+    pub async fn download_media(
+        &self,
+        uri: OwnedMxcUri,
+        file: PathBuf,
+        output_buffer: Option<BufferHandle>,
+    ) {
+        let connection = if let Some(c) = self.connection() {
+            c
+        } else {
+            self.print_with_prefix_to(
+                output_buffer.as_ref(),
+                &Weechat::prefix(Prefix::Error),
+                "You must be connected to execute this command",
+            );
+            return;
+        };
+
+        let client = connection.client().clone();
+        let request = MediaRequestParameters {
+            source: MediaSource::Plain(uri),
+            format: MediaFormat::File,
+        };
+        let display_file =
+            Self::display_download_path(&file).display().to_string();
+
+        self.print_with_prefix_to(
+            output_buffer.as_ref(),
+            &Weechat::prefix(Prefix::Network),
+            &format!("Downloading media to {}", display_file),
+        );
+
+        match connection
+            .spawn(async move {
+                client.media().get_media_content(&request, true).await
+            })
+            .await
+        {
+            Ok(content) => {
+                if let Some(parent) = file.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            self.print_with_prefix_to(
+                                output_buffer.as_ref(),
+                                &Weechat::prefix(Prefix::Error),
+                                &format!(
+                                    "Error creating media directory {}: {:#?}",
+                                    parent.display(),
+                                    e
+                                ),
+                            );
+                            return;
+                        }
+                    }
+                }
+
+                if let Err(e) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&file)
+                    .and_then(|mut file| file.write_all(&content))
+                {
+                    self.print_with_prefix_to(
+                        output_buffer.as_ref(),
+                        &Weechat::prefix(Prefix::Error),
+                        &format!(
+                            "Error writing media to {}: {:#?}",
+                            display_file, e
+                        ),
+                    );
+                } else {
+                    self.print_with_prefix_to(
+                        output_buffer.as_ref(),
+                        &Weechat::prefix(Prefix::Network),
+                        &format!(
+                            "Successfully downloaded media to {}",
+                            display_file
+                        ),
+                    );
+                }
+            }
+            Err(e) => {
+                self.print_with_prefix_to(
+                    output_buffer.as_ref(),
+                    &Weechat::prefix(Prefix::Error),
+                    &format!("Error downloading media {:#?}", e),
+                );
+            }
+        }
+    }
+
+    fn display_download_path(file: &Path) -> PathBuf {
+        if file.is_absolute() {
+            file.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(file))
+                .unwrap_or_else(|_| file.to_path_buf())
+        }
+    }
+
+    async fn list_own_devices(
+        &self,
+        connection: Connection,
+    ) -> Result<(), Error> {
+        let client = connection.client();
+        let mut response = connection.devices().await?;
+
+        if response.devices.is_empty() {
+            self.print_error("No devices were found for this server");
+            return Ok(());
+        }
+
+        self.print_network(&format!(
+            "Devices for server {}{}{}:",
+            Weechat::color("chat_server"),
+            self.name(),
+            Weechat::color("reset")
+        ));
+
+        response.devices.sort_by_key(|d| Reverse(d.last_seen_ts));
+        let own_device_id = client.device_id();
+        let own_user_id = client
+            .session_meta()
+            .map(|s| s.user_id.to_owned())
+            .expect("Getting our own devices while not being logged in");
+
+        let mut lines: Vec<String> = Vec::new();
+
+        for device_info in response.devices {
+            let client = client.clone();
+            let own_user_id = own_user_id.clone();
+            let device_info_move = device_info.clone();
+            let device = match connection
+                .spawn(async move {
+                    client
+                        .clone()
+                        .encryption()
+                        .get_device(&own_user_id, &device_info_move.device_id)
+                        .await
+                })
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    self.print_error(&format!("Failed to obtain device: {e}"));
+                    continue;
+                }
+            };
+
+            let own_device = own_device_id == Some(&device_info.device_id);
+
+            let device_trust = match (own_device, device.as_ref()) {
+                (true, Some(_)) => DeviceTrust::Verified,
+                (true, None) => DeviceTrust::MissingKeys,
+                (false, Some(device)) if device.is_verified() => {
+                    DeviceTrust::Verified
+                }
+                (false, Some(_)) => DeviceTrust::Unverified,
+                (false, None) => DeviceTrust::Unsupported,
+            };
+
+            let info = Self::format_device(
+                &device_info.device_id,
+                device.and_then(|d| {
+                    d.get_key(DeviceKeyAlgorithm::Ed25519)
+                        .map(|f| f.to_base64())
+                }),
+                device_info.display_name.as_deref(),
+                own_device,
+                device_trust,
+                device_info.last_seen_ip,
+                device_info.last_seen_ts,
+            );
+
+            lines.push(info);
+        }
+
+        let line = lines.join("\n");
+        self.print(&line);
+
+        Ok(())
+    }
+
+    async fn list_other_devices(
+        &self,
+        connection: Connection,
+        user_id: &UserId,
+    ) -> Result<(), Error> {
+        let devices = connection
+            .client()
+            .encryption()
+            .get_user_devices(user_id)
+            .await?;
+
+        let lines: Vec<_> = devices
+            .devices()
+            .map(|device| {
+                let device_trust = if device.is_verified() {
+                    DeviceTrust::Verified
+                } else {
+                    DeviceTrust::Unverified
+                };
+
+                Self::format_device(
+                    device.device_id(),
+                    device
+                        .get_key(DeviceKeyAlgorithm::Ed25519)
+                        .map(|f| f.to_base64()),
+                    device.display_name(),
+                    false,
+                    device_trust,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+
+        let user_color = Weechat::info_get("nick_color_name", user_id.as_str())
+            .expect("Can't get user color");
+
+        if lines.is_empty() {
+            self.print_error(&format!(
+                "No devices were found for user {}{}{} on this server",
+                Weechat::color(&user_color),
+                user_id.as_str(),
+                Weechat::color("reset"),
+            ));
+        } else {
+            self.print_network(&format!(
+                "Devices for user {}{}{} on server {}{}{}:",
+                Weechat::color(&user_color),
+                user_id.as_str(),
+                Weechat::color("reset"),
+                Weechat::color("chat_server"),
+                self.name(),
+                Weechat::color("reset")
+            ));
+
+            let line = lines.join("\n");
+            self.print(&line);
+        }
+
+        Ok(())
+    }
+
+    fn format_device(
+        device_id: &DeviceId,
+        fingerprint: Option<String>,
+        display_name: Option<&str>,
+        is_own_device: bool,
+        device_trust: DeviceTrust,
+        last_seen_ip: Option<String>,
+        last_seen_ts: Option<MilliSecondsSinceUnixEpoch>,
+    ) -> String {
+        let device_color =
+            Weechat::info_get("nick_color_name", device_id.as_str())
+                .expect("Can't get device color");
+
+        let last_seen_date = last_seen_ts
+            .and_then(|d| {
+                d.to_system_time().map(|d| {
+                    let date: DateTime<Utc> = d.into();
+                    date.format("%Y/%m/%d %H:%M").to_string()
+                })
+            })
+            .unwrap_or_else(|| "?".to_string());
+
+        let last_seen = format!(
+            "{} @ {}",
+            last_seen_ip.as_deref().unwrap_or("-"),
+            last_seen_date
+        );
+
+        let (bold, color) = if is_own_device {
+            (Weechat::color("bold"), format!("*{}", device_color))
+        } else {
+            ("", device_color)
+        };
+
+        let verified = match device_trust {
+            DeviceTrust::Verified => {
+                format!(
+                    "{}{}{}",
+                    Weechat::color("green"),
+                    device_trust_label(device_trust),
+                    Weechat::color("reset")
+                )
+            }
+            DeviceTrust::Unverified => {
+                format!(
+                    "{}{}{}",
+                    Weechat::color("red"),
+                    device_trust_label(device_trust),
+                    Weechat::color("reset")
+                )
+            }
+            DeviceTrust::MissingKeys => {
+                format!(
+                    "{}{}{}",
+                    Weechat::color("yellow"),
+                    device_trust_label(device_trust),
+                    Weechat::color("reset")
+                )
+            }
+            DeviceTrust::Unsupported => {
+                format!(
+                    "{}{}{}",
+                    Weechat::color("darkgray"),
+                    device_trust_label(device_trust),
+                    Weechat::color("reset")
+                )
+            }
+        };
+
+        let fingerprint = if let Some(fingerprint) = fingerprint {
+            let fingerprint = fingerprint
+                .chars()
+                .collect::<Vec<char>>()
+                .chunks(4)
+                .map(|c| c.iter().collect::<String>())
+                .collect::<Vec<String>>()
+                .join(" ");
+
+            format!(
+                "{}{}{}",
+                Weechat::color("magenta"),
+                fingerprint,
+                Weechat::color("reset")
+            )
+        } else {
+            format!(
+                "{}-{}",
+                Weechat::color("darkgray"),
+                Weechat::color("reset")
+            )
+        };
+
+        format!(
+            "       \
+                                    Name: {}{}\n  \
+                               Device ID: {}{}{}\n   \
+                                Security: {}\n\
+                             Fingerprint: {}\n  \
+                               Last seen: {}\n",
+            bold,
+            display_name.unwrap_or(""),
+            Weechat::color(&color),
+            device_id.as_str(),
+            Weechat::color("reset"),
+            verified,
+            fingerprint,
+            last_seen,
+        )
+    }
+
+    pub async fn devices(&self, user_id: Option<OwnedUserId>) {
+        let connection = if let Some(c) = self.connection() {
+            c
+        } else {
+            self.print_error("You must be connected to execute this command");
+            return;
+        };
+
+        let ret = if let Some(user_id) = user_id.as_ref() {
+            if Some(user_id.as_ref()) == connection.client().user_id() {
+                self.list_own_devices(connection).await
+            } else {
+                self.list_other_devices(connection, user_id).await
+            }
+        } else {
+            self.list_own_devices(connection).await
+        };
+
+        if let Err(e) = ret {
+            self.print_error(&format!("Error fetching devices {:?}", e));
+        }
+    }
+
+    pub async fn start_verification(&self, user_id: OwnedUserId) {
+        let Some(connection) = self.connection() else {
+            self.print_error("You must be connected to execute this command");
+            return;
+        };
+
+        let client = connection.client().clone();
+        let requested_user_id = user_id.clone();
+        let result = connection
+            .spawn(async move {
+                let Some(identity) = client
+                    .encryption()
+                    .request_user_identity(&requested_user_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+
+                identity
+                    .request_verification()
+                    .await
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            })
+            .await;
+
+        match result {
+            Ok(Some(request)) => {
+                self.print_network(&format!(
+                    "Sent a verification request to {}",
+                    user_id
+                ));
+
+                if request.room_id().is_none() {
+                    let flow_id = request.flow_id().to_owned();
+                    let buffer = VerificationBuffer::new(
+                        &self.server_name,
+                        &user_id,
+                        request,
+                        self.connection.clone(),
+                    );
+                    self.verification_buffers
+                        .borrow_mut()
+                        .insert(flow_id, buffer);
+                }
+            }
+            Ok(None) => self.print_error(&format!(
+                "No cross-signing identity was found for {}",
+                user_id
+            )),
+            Err(error) => self.print_error(&format!(
+                "Error starting verification with {}: {}",
+                user_id, error
+            )),
+        }
+    }
+
+    pub async fn mark_device_verified(
+        &self,
+        user_id: OwnedUserId,
+        device_id: OwnedDeviceId,
+    ) {
+        let Some(connection) = self.connection() else {
+            self.print_error("You must be connected to execute this command");
+            return;
+        };
+
+        let client = connection.client().clone();
+        let requested_user_id = user_id.clone();
+        let requested_device_id = device_id.clone();
+        let result = connection
+            .spawn(async move {
+                client
+                    .encryption()
+                    .request_user_identity(&requested_user_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+
+                let Some(device) = client
+                    .encryption()
+                    .get_device(&requested_user_id, &requested_device_id)
+                    .await
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok::<_, String>(false);
+                };
+
+                device
+                    .set_local_trust(LocalTrust::Verified)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(true)
+            })
+            .await;
+
+        match result {
+            Ok(true) => self.print_network(&format!(
+                "Marked device {} of {} as locally verified on this client",
+                device_id, user_id
+            )),
+            Ok(false) => self.print_error(&format!(
+                "Device {} of {} was not found",
+                device_id, user_id
+            )),
+            Err(error) => self.print_error(&format!(
+                "Error marking device {} of {} as locally verified: {}",
+                device_id, user_id, error
+            )),
+        }
+    }
+
+    pub async fn verification_info(&self, user_id: Option<OwnedUserId>) {
+        let Some(connection) = self.connection() else {
+            self.print_error("You must be connected to execute this command");
+            return;
+        };
+
+        let client = connection.client().clone();
+        let result = connection
+            .spawn(async move {
+                let encryption = client.encryption();
+                let refresh_identity = user_id.is_some();
+                let mut users = if let Some(user_id) = user_id {
+                    vec![user_id]
+                } else {
+                    encryption
+                        .tracked_users()
+                        .await
+                        .map_err(|error| error.to_string())?
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                };
+                users.sort();
+
+                let mut report = Vec::new();
+
+                for user_id in users {
+                    let identity = if refresh_identity {
+                        encryption
+                            .request_user_identity(&user_id)
+                            .await
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        encryption
+                            .get_user_identity(&user_id)
+                            .await
+                            .map_err(|error| error.to_string())?
+                    };
+                    let identity_state = match identity.as_ref() {
+                        Some(identity)
+                            if identity.has_verification_violation() =>
+                        {
+                            "verification violation"
+                        }
+                        Some(identity) if identity.is_verified() => "verified",
+                        Some(identity)
+                            if identity.was_previously_verified() =>
+                        {
+                            "previously verified"
+                        }
+                        Some(_) => "not verified",
+                        None => "no cross-signing identity",
+                    };
+
+                    report.push(format!("{}: {}", user_id, identity_state));
+
+                    let devices = encryption
+                        .get_user_devices(&user_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    let mut device_lines = devices
+                        .devices()
+                        .map(|device| {
+                            let state = if device
+                                .is_verified_with_cross_signing()
+                            {
+                                "verified by cross-signing"
+                            } else {
+                                match device.local_trust_state() {
+                                    LocalTrust::Verified => {
+                                        "locally trusted only"
+                                    }
+                                    LocalTrust::BlackListed => "blacklisted",
+                                    LocalTrust::Ignored => "ignored",
+                                    LocalTrust::Unset
+                                        if device.is_verified() =>
+                                    {
+                                        "verified"
+                                    }
+                                    LocalTrust::Unset => "not verified",
+                                }
+                            };
+                            let name = device
+                                .display_name()
+                                .map(|name| format!(" ({name})"))
+                                .unwrap_or_default();
+
+                            format!(
+                                "  {}{}: {}",
+                                device.device_id(),
+                                name,
+                                state
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    device_lines.sort();
+                    report.extend(device_lines);
+                }
+
+                Ok::<_, String>(report)
+            })
+            .await;
+
+        match result {
+            Ok(report) if report.is_empty() => self.print_error(
+                "No tracked Matrix contacts have verification information",
+            ),
+            Ok(report) => {
+                self.print_network("Matrix verification state:");
+                self.print(&report.join("\n"));
+            }
+            Err(error) => self.print_error(&format!(
+                "Error fetching Matrix verification state: {}",
+                error
+            )),
+        }
+    }
+
+    pub fn autoconnect(&self) -> bool {
+        self.settings.borrow().autoconnect
+    }
+
+    pub fn is_connection_secure(&self) -> bool {
+        let settings = self.current_settings.borrow();
+
+        settings.ssl_verify
+            && settings
+                .homeserver
+                .as_ref()
+                .map(|u| u.scheme() == "https")
+                .unwrap_or(false)
+    }
+
+    pub fn disconnect(&self) {
+        if !self.connected() {
+            self.print_error(&format!(
+                "Not connected to {}{}{}",
+                Weechat::color("chat_server"),
+                self.name(),
+                Weechat::color("reset")
+            ));
+
+            return;
+        }
+
+        {
+            let connection = self.connection.borrow_mut().take();
+            if let Some(connection) = connection.as_ref() {
+                connection.shutdown();
+            }
+            drop(connection);
+        }
+
+        self.print_network(&format!(
+            "Disconnected from {}{}{}",
+            Weechat::color("chat_server"),
+            self.name(),
+            Weechat::color("reset")
+        ));
+    }
+
+    pub fn shutdown(&self) {
+        let connection = self.connection.borrow_mut().take();
+        let runtime = connection.as_ref().map(|c| {
+            c.shutdown();
+            c.runtime()
+        });
+
+        if let Some(runtime) = runtime {
+            with_entered_runtime_until_final_drop(runtime, || {
+                self.shutdown_sdk_state();
+                drop(connection);
+            });
+        } else {
+            let runtime = self.servers.runtime().to_owned();
+            let _guard = runtime.enter();
+            self.shutdown_sdk_state();
+        }
+    }
+
+    fn shutdown_sdk_state(&self) {
+        for verification in self.verification_buffers.borrow().values() {
+            verification.release_sdk_state();
+        }
+        self.verification_buffers.borrow_mut().clear();
+
+        for room in self.rooms.borrow().values() {
+            room.release_sdk_state();
+        }
+        self.rooms.borrow_mut().clear();
+
+        let mut client = self.client.borrow_mut();
+        client.take();
+    }
+
+    pub fn get_info_str(&self, details: bool) -> String {
+        let mut s = String::from(&format!(
+            "{}{}{} [{}]",
+            Weechat::color("chat_server"),
+            self.server_name.as_ref().to_owned(),
+            Weechat::color("reset"),
+            if self.connected() {
+                "connected"
+            } else {
+                "not connected"
+            }
+        ));
+
+        if !details {
+            return s;
+        }
+
+        let settings = self.settings.borrow();
+        s.push_str(&format!(
+            "\n\
+                 {:indent$}homeserver: {}\n\
+                 {:indent$}proxy: {}\n\
+                 {:indent$}autoconnect: {}\n\
+                 {:indent$}username: {}\n",
+            "",
+            settings.homeserver.as_ref().map_or("", |url| url.as_str()),
+            "",
+            settings.proxy.as_ref().map_or("", |url| url.as_str()),
+            "",
+            settings.autoconnect,
+            "",
+            settings.username,
+            indent = 8
+        ));
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        create_room_request, device_trust_label, missing_alias_action,
+        room_id_join_servers, room_key_withheld_message,
+        secure_set_token_command, with_entered_runtime_until_drop, DeviceTrust,
+        InnerServer, MissingAliasAction,
+    };
+    use matrix_sdk::ruma::{
+        events::room_key::withheld::{
+            RoomKeyWithheldCodeInfo, RoomKeyWithheldSessionData,
+        },
+        owned_room_id, user_id, OwnedRoomAliasId, OwnedRoomId, OwnedUserId,
+    };
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    };
+    use tokio::runtime::{Handle, Runtime};
+
+    const NOT_DROPPED: u8 = 0;
+    const DROPPED_OUTSIDE_RUNTIME: u8 = 1;
+    const DROPPED_INSIDE_RUNTIME: u8 = 2;
+
+    struct DropProbe(Arc<AtomicU8>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            let context = if Handle::try_current().is_ok() {
+                DROPPED_INSIDE_RUNTIME
+            } else {
+                DROPPED_OUTSIDE_RUNTIME
+            };
+
+            self.0.store(context, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn labels_server_listed_devices_without_uploaded_keys() {
+        assert_eq!(
+            device_trust_label(DeviceTrust::MissingKeys),
+            "No uploaded keys"
+        );
+    }
+
+    #[test]
+    fn secure_token_command_does_not_store_literal_quotes() {
+        assert_eq!(
+            secure_set_token_command(
+                "matrix_access_token",
+                "syt_Abc-123._~+/="
+            )
+            .as_deref(),
+            Some("/secure set matrix_access_token syt_Abc-123._~+/=")
+        );
+    }
+
+    #[test]
+    fn secure_token_command_rejects_command_delimiters() {
+        assert_eq!(
+            secure_set_token_command("matrix_access_token", "\"syt_token\""),
+            None
+        );
+        assert_eq!(
+            secure_set_token_command("matrix_access_token", "syt token"),
+            None
+        );
+        assert_eq!(
+            secure_set_token_command("matrix_access_token", "syt\n/set x y"),
+            None
+        );
+    }
+
+    #[test]
+    fn keeps_absolute_download_path_for_display() {
+        let path = Path::new("/tmp/matrix-media");
+
+        assert_eq!(InnerServer::display_download_path(path), path);
+    }
+
+    #[test]
+    fn expands_relative_download_path_for_display() {
+        let path = Path::new("matrix-media");
+        let expected = std::env::current_dir()
+            .expect("current working directory")
+            .join(path);
+
+        assert_eq!(InnerServer::display_download_path(path), expected);
+    }
+
+    #[test]
+    fn preserves_absolute_pathbuf_for_display() {
+        let path = PathBuf::from("/tmp/matrix-media");
+
+        assert_eq!(InnerServer::display_download_path(&path), path);
+    }
+
+    #[test]
+    fn final_runtime_drop_happens_while_handle_is_entered() {
+        let runtime = Rc::new(Runtime::new().expect("runtime"));
+        let drop_context = Arc::new(AtomicU8::new(NOT_DROPPED));
+        let final_drop_context = Arc::clone(&drop_context);
+
+        with_entered_runtime_until_drop(
+            runtime,
+            || {},
+            |runtime| {
+                let probe = DropProbe(final_drop_context);
+                drop(runtime);
+                drop(probe);
+            },
+        );
+
+        assert_eq!(drop_context.load(Ordering::SeqCst), DROPPED_INSIDE_RUNTIME);
+    }
+
+    #[test]
+    fn creates_only_missing_aliases_on_the_account_domain() {
+        let alias = "#new-room:example.org"
+            .parse::<OwnedRoomAliasId>()
+            .expect("valid room alias");
+        let user_id = "@alice:example.org"
+            .parse::<OwnedUserId>()
+            .expect("valid user ID");
+
+        assert_eq!(
+            missing_alias_action(&alias, Some(&user_id)),
+            MissingAliasAction::CreateRoom {
+                alias_localpart: "new-room".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn refuses_missing_foreign_aliases() {
+        let alias = "#new-room:elsewhere.example"
+            .parse::<OwnedRoomAliasId>()
+            .expect("valid room alias");
+        let user_id = "@alice:example.org"
+            .parse::<OwnedUserId>()
+            .expect("valid user ID");
+
+        assert_eq!(
+            missing_alias_action(&alias, Some(&user_id)),
+            MissingAliasAction::RefuseForeignAlias
+        );
+    }
+
+    #[test]
+    fn refuses_missing_alias_without_an_account_domain() {
+        let alias = "#new-room:example.org"
+            .parse::<OwnedRoomAliasId>()
+            .expect("valid room alias");
+
+        assert_eq!(
+            missing_alias_action(&alias, None),
+            MissingAliasAction::RefuseUnknownAccountDomain
+        );
+    }
+
+    fn withheld_session(code: &str) -> Box<RoomKeyWithheldSessionData> {
+        RoomKeyWithheldSessionData::new(
+            owned_room_id!("!room:example.org"),
+            code.to_owned(),
+        )
+        .into()
+    }
+
+    #[test]
+    fn unavailable_key_from_own_device_does_not_blame_foreign_sender() {
+        let own_user = user_id!("@me:example.org");
+        let message = room_key_withheld_message(
+            &RoomKeyWithheldCodeInfo::Unavailable(withheld_session("s1")),
+            own_user,
+            Some(own_user),
+            None,
+        );
+
+        assert!(message.contains("your other device does not have this key"));
+        assert!(!message.contains("Ask them"));
+        assert!(!message.contains("re-send"));
+    }
+
+    #[test]
+    fn unauthorised_key_refusal_says_device_is_not_entitled() {
+        let own_user = user_id!("@me:example.org");
+        let message = room_key_withheld_message(
+            &RoomKeyWithheldCodeInfo::Unauthorized(withheld_session("s1")),
+            own_user,
+            Some(own_user),
+            None,
+        );
+
+        assert!(message.contains("this device is not entitled"));
+        assert!(!message.contains("Ask them"));
+        assert!(!message.contains("share the room key"));
+    }
+
+    #[test]
+    fn no_olm_guidance_describes_future_session_establishment() {
+        let sender = user_id!("@alice:example.org");
+        let own_user = user_id!("@me:example.org");
+        let message = room_key_withheld_message(
+            &RoomKeyWithheldCodeInfo::NoOlm,
+            sender,
+            Some(own_user),
+            None,
+        );
+
+        assert!(message.contains("could not establish an encrypted session"));
+        assert!(message.contains("new messages should decrypt"));
+        assert!(!message.contains("share the room key again"));
+        assert!(!message.contains("both devices are online"));
+    }
+
+    #[test]
+    fn uses_room_id_origin_server_as_join_via() {
+        let room_id = "!opaque-room-id:origin.example"
+            .parse::<OwnedRoomId>()
+            .expect("valid room ID");
+
+        assert_eq!(
+            room_id_join_servers(&room_id)
+                .into_iter()
+                .map(|server| server.to_string())
+                .collect::<Vec<_>>(),
+            vec!["origin.example"]
+        );
+    }
+
+    #[test]
+    fn create_room_request_registers_the_alias_during_room_creation() {
+        let request = create_room_request("new-room".to_owned());
+
+        assert_eq!(request.room_alias_name.as_deref(), Some("new-room"));
+    }
+}

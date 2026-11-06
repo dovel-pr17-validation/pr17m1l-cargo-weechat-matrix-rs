@@ -1,0 +1,1247 @@
+use std::{
+    cell::RefCell,
+    future::Future,
+    path::PathBuf,
+    rc::{Rc, Weak},
+    time::Duration,
+};
+
+use tokio::{
+    runtime::Runtime,
+    sync::mpsc::{channel, Receiver, Sender},
+    task::JoinHandle,
+};
+
+use tracing::error;
+
+use matrix_sdk::{
+    self,
+    authentication::matrix::MatrixSession,
+    config::SyncSettings,
+    deserialized_responses::AmbiguityChange,
+    room::{Messages, MessagesOptions, Receipts, Room},
+    ruma::{
+        api::client::{
+            device::{
+                delete_device::{self, v3::Response as DeleteDeviceResponse},
+                delete_devices::v3::Response as DeleteDevicesResponse,
+                get_devices::v3::Response as DevicesResponse,
+            },
+            filter::{
+                FilterDefinition, LazyLoadOptions, RoomEventFilter, RoomFilter,
+            },
+            message::send_message_event,
+            session::{
+                get_login_types::v3::LoginType,
+                login::v3::Response as LoginResponse,
+            },
+            sync::sync_events::v3::Filter,
+            threads::get_threads::v1::{
+                IncludeThreads, Request as GetThreadsRequest,
+                Response as GetThreadsResponse,
+            },
+            uiaa::{AuthData, MatrixUserIdentifier, Password, UserIdentifier},
+        },
+        events::{
+            room::member::RoomMemberEventContent, AnyMessageLikeEventContent,
+            AnySyncEphemeralRoomEvent, AnySyncStateEvent, AnySyncTimelineEvent,
+            AnyToDeviceEvent, SyncStateEvent,
+        },
+        OwnedDeviceId, OwnedEventId, OwnedRoomId, OwnedTransactionId,
+        OwnedUserId,
+    },
+    store::RoomLoadSettings,
+    sync::State,
+    utils::local_server::LocalServerBuilder,
+    Client, HttpError, LoopCtrl, Result as MatrixResult, RoomMemberships,
+    SessionChange, SessionMeta, SessionTokens,
+};
+
+use weechat::{Task, Weechat};
+
+use crate::{
+    room::PrevBatch,
+    server::{InnerServer, MatrixServer},
+};
+
+const DEFAULT_SYNC_TIMEOUT: Duration = Duration::from_secs(30);
+const THREAD_LIST_PAGE_SIZE: u8 = 20;
+const SEND_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+];
+const SYNC_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+const SYNC_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+const ROOM_METADATA_TIMEOUT: Duration = Duration::from_secs(30);
+const SSO_CALLBACK_PORT: u16 = 29_325;
+
+fn is_retryable_network_error(error: &matrix_sdk::Error) -> bool {
+    matches!(
+        error,
+        matrix_sdk::Error::Http(http)
+            if matches!(http.as_ref(), HttpError::Reqwest(_))
+    )
+}
+
+fn send_retry_delay(attempt: usize) -> Option<Duration> {
+    SEND_RETRY_DELAYS.get(attempt).copied()
+}
+
+fn sync_retry_delay(failures: u32) -> Duration {
+    let multiplier = 1u32.checked_shl(failures).unwrap_or(u32::MAX);
+    SYNC_RETRY_INITIAL_DELAY
+        .saturating_mul(multiplier)
+        .min(SYNC_RETRY_MAX_DELAY)
+}
+
+fn should_restart_completed_sync(channel_closed: bool) -> bool {
+    !channel_closed
+}
+
+pub struct InteractiveAuthInfo {
+    pub user: String,
+    pub password: String,
+    pub session: Option<String>,
+}
+
+impl InteractiveAuthInfo {
+    pub fn as_auth_data(&self) -> AuthData {
+        AuthData::Password(Password::new(
+            UserIdentifier::Matrix(MatrixUserIdentifier::new(
+                self.user.clone(),
+            )),
+            self.password.clone(),
+        ))
+    }
+}
+
+pub enum ClientMessage {
+    LoginMessage(LoginResponse),
+    SessionRestored(OwnedUserId),
+    SessionTokensRefreshed(SessionTokens),
+    SsoLoginUrl(String),
+    SyncState(OwnedRoomId, AnySyncStateEvent),
+    SyncEvent(OwnedRoomId, AnySyncTimelineEvent),
+    EphemeralRoomEvent(OwnedRoomId, AnySyncEphemeralRoomEvent),
+    ToDeviceEvent(AnyToDeviceEvent),
+    MemberEvent(
+        OwnedRoomId,
+        SyncStateEvent<RoomMemberEventContent>,
+        bool,
+        Option<AmbiguityChange>,
+    ),
+    RestoredRoom(OwnedRoomId),
+    RoomMetadata {
+        room_id: OwnedRoomId,
+        is_direct: bool,
+        display_name: Option<String>,
+    },
+}
+
+/// Struct representing an active connection to the homeserver.
+///
+/// Since the rust-sdk `Client` object uses reqwest for the HTTP client making
+/// requests requires the request to be made on a tokio runtime. The connection
+/// wraps the `Client` object and makes sure that requests are run on the
+/// runtime the `Connection` holds.
+///
+/// While this struct is alive a sync loop will be going on. To cancel the sync
+/// loop drop the object.
+#[derive(Debug, Clone)]
+pub struct Connection {
+    receiver_task: Rc<RefCell<Option<Task<()>>>>,
+    sync_task: Rc<RefCell<Option<JoinHandle<()>>>>,
+    client: Option<Client>,
+    runtime: Option<Rc<Runtime>>,
+}
+
+impl Connection {
+    pub fn runtime(&self) -> Rc<Runtime> {
+        self.runtime
+            .as_ref()
+            .expect("Connection runtime was already dropped")
+            .clone()
+    }
+
+    pub fn client(&self) -> &Client {
+        self.client
+            .as_ref()
+            .expect("Connection client was already dropped")
+    }
+
+    pub async fn spawn<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime()
+            .spawn(future)
+            .await
+            .expect("Tokio error while sending a message")
+    }
+
+    async fn try_spawn<F>(&self, future: F) -> Result<F::Output, String>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        self.runtime()
+            .spawn(future)
+            .await
+            .map_err(|error| format!("Matrix runtime task failed: {error}"))
+    }
+
+    /// Read plugin-owned data from the Matrix state store on its Tokio runtime.
+    ///
+    /// Matrix SDK stores may use Tokio-backed pools internally. Keeping this
+    /// operation here prevents callers running on WeeChat's local executor from
+    /// polling those futures directly and aborting across the plugin FFI boundary.
+    pub async fn get_custom_store_value(
+        &self,
+        key: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let client = self.client().clone();
+        self.try_spawn(async move {
+            client
+                .state_store()
+                .get_custom_value(&key)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await?
+    }
+
+    /// Persist plugin-owned data on the Matrix SDK Tokio runtime.
+    pub async fn set_custom_store_value(
+        &self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
+        let client = self.client().clone();
+        self.try_spawn(async move {
+            client
+                .state_store()
+                .set_custom_value_no_read(&key, value)
+                .await
+                .map_err(|error| error.to_string())
+        })
+        .await?
+    }
+
+    /// Join a room on the Matrix SDK Tokio runtime.
+    pub async fn join_room_on_runtime(
+        &self,
+        room_id: OwnedRoomId,
+    ) -> Result<Room, String> {
+        let client = self.client().clone();
+        self.try_spawn(async move { client.join_room_by_id(&room_id).await })
+            .await?
+            .map_err(|error| error.to_string())
+    }
+
+    /// Bound upgrade joins while polling both the timer and SDK on Tokio.
+    pub async fn join_room_with_timeout(
+        &self,
+        room_id: OwnedRoomId,
+        timeout: std::time::Duration,
+    ) -> Result<Result<Room, matrix_sdk::Error>, tokio::time::error::Elapsed>
+    {
+        let client = self.client().clone();
+        self.spawn(async move {
+            tokio::time::timeout(timeout, client.join_room_by_id(&room_id))
+                .await
+        })
+        .await
+    }
+
+    pub fn shutdown(&self) {
+        let runtime = self.runtime();
+
+        self.stop_sync_task(&runtime);
+        self.stop_receiver_task(&runtime);
+    }
+
+    fn stop_sync_task(&self, runtime: &Runtime) {
+        let Some(task) = self.sync_task.borrow_mut().take() else {
+            return;
+        };
+
+        task.abort();
+        let _ = runtime.block_on(async { task.await });
+    }
+
+    fn stop_receiver_task(&self, runtime: &Runtime) {
+        let Some(task) = self.receiver_task.borrow_mut().take() else {
+            return;
+        };
+
+        let _guard = runtime.enter();
+        drop(task);
+    }
+
+    pub fn new(server: &MatrixServer, client: &Client) -> Self {
+        let (tx, rx) = channel(10_000);
+
+        let server_name = server.name();
+
+        let receiver_task = Weechat::spawn(Connection::response_receiver(
+            rx,
+            server.clone_weak(),
+        ));
+
+        let runtime = Runtime::new().unwrap();
+
+        let sync_task = runtime.spawn(Connection::sync_loop(
+            client.clone(),
+            tx,
+            server.user_name(),
+            server.password(),
+            server.access_token(),
+            server.refresh_token(),
+            server.device_id(),
+            server_name.to_string(),
+            server.get_server_path(),
+        ));
+
+        Self {
+            receiver_task: Rc::new(RefCell::new(Some(receiver_task))),
+            sync_task: Rc::new(RefCell::new(Some(sync_task))),
+            client: Some(client.clone()),
+            runtime: Some(runtime.into()),
+        }
+    }
+
+    /// Send a message to the given room.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The id of the room which the message should be sent to.
+    ///
+    /// * `content` - The content of the message that will be sent to the
+    ///   server.
+    ///
+    /// * `transaction_id` - Attach an unique id to this message, later on the
+    ///   event will contain the same id in the unsigned part of the event.
+    pub async fn send_message(
+        &self,
+        room: Room,
+        content: AnyMessageLikeEventContent,
+        transaction_id: Option<OwnedTransactionId>,
+    ) -> MatrixResult<send_message_event::v3::Response> {
+        self.spawn(async move {
+            let mut attempt = 0;
+
+            loop {
+                let mut msg = room.send(content.clone());
+                if let Some(txn_id) = transaction_id.as_deref() {
+                    msg = msg.with_transaction_id(txn_id.to_owned());
+                }
+
+                match msg.await {
+                    Ok(result) => return Ok(result.response),
+                    Err(error)
+                        if is_retryable_network_error(&error)
+                            && send_retry_delay(attempt).is_some() =>
+                    {
+                        let delay = send_retry_delay(attempt)
+                            .expect("delay checked above");
+                        attempt += 1;
+                        error!(
+                            "Matrix message send failed due to a network error, retrying in {}s: {error}",
+                            delay.as_secs()
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        })
+        .await
+    }
+
+    pub async fn delete_devices(
+        &self,
+        devices: Vec<OwnedDeviceId>,
+        auth_info: Option<InteractiveAuthInfo>,
+    ) -> MatrixResult<DeleteDevicesResponse> {
+        let client = self.client().clone();
+        Ok(self
+            .spawn(async move {
+                if let Some(info) = auth_info {
+                    let auth = Some(info.as_auth_data());
+                    client.delete_devices(&devices, auth).await
+                } else {
+                    client.delete_devices(&devices, None).await
+                }
+            })
+            .await?)
+    }
+
+    pub async fn delete_device(
+        &self,
+        device: OwnedDeviceId,
+        auth_info: Option<InteractiveAuthInfo>,
+    ) -> MatrixResult<DeleteDeviceResponse> {
+        let client = self.client().clone();
+        Ok(self
+            .spawn(async move {
+                let mut request = delete_device::v3::Request::new(device);
+                request.auth = auth_info.map(|info| info.as_auth_data());
+                client.send(request).await
+            })
+            .await?)
+    }
+
+    /// Fetch historical messages for the given room.
+    pub async fn room_messages(
+        &self,
+        room: Room,
+        prev_batch: PrevBatch,
+        limit: u16,
+    ) -> MatrixResult<Messages> {
+        self.spawn(async move {
+            let mut request = match &prev_batch {
+                PrevBatch::Backwards(t) => {
+                    MessagesOptions::backward().from(t.as_deref())
+                }
+                PrevBatch::Forward(t) => {
+                    MessagesOptions::forward().from(Some(t.as_ref()))
+                }
+            };
+            request.limit = limit.into();
+
+            room.messages(request).await
+        })
+        .await
+    }
+
+    /// List the thread roots of the given room.
+    ///
+    /// This is the `GET /_matrix/client/v1/rooms/{roomId}/threads` endpoint,
+    /// the only server-side way to discover threads without already knowing
+    /// their root event IDs.
+    pub async fn room_threads(
+        &self,
+        room_id: OwnedRoomId,
+        include: IncludeThreads,
+        from: Option<String>,
+    ) -> MatrixResult<GetThreadsResponse> {
+        let client = self.client().clone();
+        self.spawn(async move {
+            let mut request = GetThreadsRequest::new(room_id);
+            request.include = include;
+            request.from = from;
+            request.limit = Some(THREAD_LIST_PAGE_SIZE.into());
+
+            Ok(client.send(request).await?)
+        })
+        .await
+    }
+
+    /// Get the list of our own devices.
+    pub async fn devices(&self) -> MatrixResult<DevicesResponse> {
+        let client = self.client().clone();
+        Ok(self.spawn(async move { client.devices().await }).await?)
+    }
+
+    /// Set or reset a typing notice.
+    ///
+    /// # Arguments
+    ///
+    /// * `room_id` - The id of the room where the typing notice should be
+    ///   active.
+    ///
+    /// * `typing` - Should we set or unset the typing notice.
+    pub async fn send_typing_notice(
+        &self,
+        room: Room,
+        typing: bool,
+    ) -> MatrixResult<()> {
+        self.spawn(async move { room.typing_notice(typing).await })
+            .await
+    }
+
+    pub async fn mark_room_as_read(
+        &self,
+        room: Room,
+        event_id: OwnedEventId,
+        public_receipt: bool,
+    ) -> MatrixResult<()> {
+        self.spawn(async move {
+            let receipts = Receipts::new().fully_read_marker(event_id.clone());
+            let receipts = if public_receipt {
+                receipts.public_read_receipt(event_id)
+            } else {
+                receipts.private_read_receipt(event_id)
+            };
+
+            room.send_multiple_receipts(receipts).await
+        })
+        .await
+    }
+
+    pub(crate) fn save_device_id(
+        user_name: &str,
+        mut server_path: PathBuf,
+        response: &LoginResponse,
+    ) -> std::io::Result<()> {
+        server_path.push(user_name);
+        server_path.set_extension("device_id");
+        std::fs::write(&server_path, &response.device_id)
+    }
+
+    fn load_device_id(
+        user_name: &str,
+        mut server_path: PathBuf,
+    ) -> std::io::Result<Option<String>> {
+        server_path.push(user_name);
+        server_path.set_extension("device_id");
+
+        let device_id = std::fs::read_to_string(server_path);
+
+        if let Err(e) = device_id {
+            // A file not found error is ok, report the rest.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e);
+            }
+            return Ok(None);
+        };
+
+        let device_id = device_id.unwrap_or_default();
+
+        if device_id.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(device_id))
+        }
+    }
+
+    fn queue_room_metadata(
+        channel: Sender<Result<ClientMessage, String>>,
+        room: Room,
+    ) {
+        tokio::spawn(async move {
+            let room_id = room.room_id().to_owned();
+            let is_direct =
+                tokio::time::timeout(ROOM_METADATA_TIMEOUT, room.is_direct())
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(false);
+            let display_name = tokio::time::timeout(
+                ROOM_METADATA_TIMEOUT,
+                room.display_name(),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .map(|name| name.to_string());
+
+            let _ = channel
+                .send(Ok(ClientMessage::RoomMetadata {
+                    room_id,
+                    is_direct,
+                    display_name,
+                }))
+                .await;
+        });
+    }
+
+    /// Response receiver loop.
+    /// This runs on the main Weechat thread and listens for responses coming
+    /// from the client running in the tokio executor.
+    pub async fn response_receiver(
+        mut receiver: Receiver<Result<ClientMessage, String>>,
+        server: Weak<InnerServer>,
+    ) {
+        while let Some(message) = receiver.recv().await {
+            let server = if let Some(s) = server.upgrade() {
+                s
+            } else {
+                return;
+            };
+
+            match message {
+                Ok(message) => match message {
+                    ClientMessage::LoginMessage(r) => server.receive_login(r),
+                    ClientMessage::SessionRestored(user_id) => {
+                        server.receive_restored_login(user_id)
+                    }
+                    ClientMessage::SessionTokensRefreshed(tokens) => {
+                        server.receive_session_tokens(tokens)
+                    }
+                    ClientMessage::SsoLoginUrl(url) => {
+                        server.receive_sso_url(&url)
+                    }
+                    ClientMessage::SyncEvent(r, e) => {
+                        server.receive_joined_timeline_event(&r, e).await
+                    }
+                    ClientMessage::SyncState(r, e) => {
+                        server.receive_joined_state_event(&r, e).await
+                    }
+                    ClientMessage::EphemeralRoomEvent(r, e) => {
+                        server.receive_joined_ephemeral_event(&r, e).await
+                    }
+                    ClientMessage::RestoredRoom(room_id) => {
+                        server.restore_room_by_id(room_id).await
+                    }
+                    ClientMessage::RoomMetadata {
+                        room_id,
+                        is_direct,
+                        display_name,
+                    } => server.receive_room_metadata(
+                        room_id,
+                        is_direct,
+                        display_name,
+                    ),
+                    ClientMessage::ToDeviceEvent(e) => {
+                        server.receive_to_device_event(e).await
+                    }
+                    ClientMessage::MemberEvent(
+                        room_id,
+                        e,
+                        is_state,
+                        change,
+                    ) => {
+                        server
+                            .receive_member(room_id, e, is_state, change)
+                            .await
+                    }
+                },
+                Err(e) => server.print_error(&format!("Ruma error {}", e)),
+            };
+        }
+    }
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn sync_filter() -> FilterDefinition {
+        let mut filter = FilterDefinition::default();
+        let mut room_filter = RoomFilter::default();
+        let mut event_filter = RoomEventFilter::default();
+
+        event_filter.lazy_load_options = LazyLoadOptions::Enabled {
+            include_redundant_members: false,
+        };
+        event_filter.limit = Some(10u16.into());
+
+        room_filter.state = event_filter;
+        filter.room = room_filter;
+
+        filter
+    }
+
+    /// Main client sync loop.
+    /// This runs on the per server tokio executor.
+    /// It communicates with the main Weechat thread using a async channel.
+    pub async fn sync_loop(
+        client: Client,
+        channel: Sender<Result<ClientMessage, String>>,
+        username: String,
+        password: String,
+        access_token: String,
+        refresh_token: String,
+        device_id: String,
+        server_name: String,
+        server_path: PathBuf,
+    ) {
+        if !client.matrix_auth().logged_in() && !access_token.is_empty() {
+            let user_id = match username.parse::<OwnedUserId>() {
+                Ok(user_id) => user_id,
+                Err(error) => {
+                    let _ = channel
+                        .send(Err(format!(
+                            "Invalid Matrix user ID for restored session: {error}"
+                        )))
+                        .await;
+                    return;
+                }
+            };
+            if device_id.is_empty() {
+                let _ = channel
+                    .send(Err(
+                        "A device ID is required with a Matrix access token"
+                            .to_owned(),
+                    ))
+                    .await;
+                return;
+            }
+            let session = MatrixSession {
+                meta: SessionMeta {
+                    user_id: user_id.clone(),
+                    device_id: OwnedDeviceId::from(device_id),
+                },
+                tokens: SessionTokens {
+                    access_token,
+                    refresh_token: (!refresh_token.is_empty())
+                        .then_some(refresh_token),
+                },
+            };
+            if let Err(error) = client
+                .matrix_auth()
+                .restore_session(session, RoomLoadSettings::default())
+                .await
+            {
+                let _ = channel
+                    .send(Err(format!(
+                        "Failed to restore Matrix access-token session: {error}"
+                    )))
+                    .await;
+                return;
+            }
+            if channel
+                .send(Ok(ClientMessage::SessionRestored(user_id)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            for room in client.joined_rooms() {
+                Self::queue_room_metadata(channel.clone(), room.clone());
+                if channel
+                    .send(Ok(ClientMessage::RestoredRoom(
+                        room.room_id().to_owned(),
+                    )))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+
+        if !client.matrix_auth().logged_in() {
+            let device_id_key = if username.is_empty() {
+                server_name.as_str()
+            } else {
+                username.as_str()
+            };
+
+            let device_id =
+                Connection::load_device_id(device_id_key, server_path.clone());
+
+            let device_id = match device_id {
+                Err(e) => {
+                    // TODO: do we want to do something with channel.send()
+                    // errors?
+                    let _ = channel
+                        .send(Err(format!(
+                        "Error while reading the device id for server {}: {:?}",
+                        server_name, e
+                    )))
+                        .await;
+                    return;
+                }
+                Ok(d) => d,
+            };
+
+            let first_login = device_id.is_none();
+            let matrix_auth = client.matrix_auth();
+
+            let login_response = if password.is_empty() {
+                let login_types = match matrix_auth.get_login_types().await {
+                    Ok(response) => response,
+                    Err(e) => {
+                        let _ = channel
+                            .send(Err(format!(
+                                "Failed to get login types: {}",
+                                e
+                            )))
+                            .await;
+                        return;
+                    }
+                };
+
+                let has_sso = login_types
+                    .flows
+                    .iter()
+                    .any(|flow| matches!(flow, LoginType::Sso(_)));
+
+                if !has_sso {
+                    let _ = channel
+                        .send(Err(
+                            "No password configured and homeserver does not advertise SSO login"
+                                .to_owned(),
+                        ))
+                        .await;
+                    return;
+                }
+
+                let url_sender = channel.clone();
+                let mut builder = matrix_auth
+                    .login_sso(move |sso_url| {
+                        async move {
+                            let _ = url_sender
+                                .send(Ok(ClientMessage::SsoLoginUrl(sso_url)))
+                                .await;
+                            // Handing the URL to WeeChat successfully completes
+                            // our callback; returning an error would abort SSO.
+                            Ok(())
+                        }
+                    })
+                    .initial_device_display_name("WeeChat-Matrix-rs")
+                    .server_builder(
+                        LocalServerBuilder::new().port_range(
+                            SSO_CALLBACK_PORT..SSO_CALLBACK_PORT + 1,
+                        ),
+                    );
+
+                if let Some(device_id) = device_id.as_ref() {
+                    builder = builder.device_id(device_id);
+                };
+
+                builder.send().await
+            } else {
+                let mut builder = matrix_auth
+                    .login_username(&username, &password)
+                    .initial_device_display_name("WeeChat-Matrix-rs");
+
+                if let Some(device_id) = device_id.as_ref() {
+                    builder = builder.device_id(device_id);
+                };
+
+                builder.send().await
+            };
+
+            match login_response {
+                Ok(response) => {
+                    if let Err(e) = Connection::save_device_id(
+                        device_id_key,
+                        server_path.clone(),
+                        &response,
+                    ) {
+                        let _ = channel
+                            .send(Err(format!(
+                            "Error while writing the device id for server {}: {:?}",
+                            server_name, e
+                        ))).await;
+                        return;
+                    }
+
+                    if channel
+                        .send(Ok(ClientMessage::LoginMessage(response)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = channel
+                        .send(Err(format!("Failed to log in: {:?}", e)))
+                        .await;
+                    return;
+                }
+            }
+
+            if !first_login {
+                for room in client.joined_rooms() {
+                    Self::queue_room_metadata(channel.clone(), room.clone());
+                    if channel
+                        .send(Ok(ClientMessage::RestoredRoom(
+                            room.room_id().to_owned(),
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Refresh tokens can be rotated by the homeserver. Persist every
+        // rotated pair on the WeeChat thread so a later restart does not try
+        // the now-invalid token from the original login.
+        let mut session_changes = client.subscribe_to_session_changes();
+        let session_client = client.clone();
+        let session_channel = channel.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = session_channel.closed() => return,
+                    change = session_changes.recv() => {
+                        match change {
+                            Ok(SessionChange::TokensRefreshed) => {
+                                let Some(tokens) =
+                                    session_client.session_tokens()
+                                else {
+                                    continue;
+                                };
+
+                                if session_channel
+                                    .send(Ok(
+                                        ClientMessage::SessionTokensRefreshed(
+                                            tokens,
+                                        ),
+                                    ))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            Ok(SessionChange::UnknownToken { .. }) => {}
+                            Err(
+                                tokio::sync::broadcast::error::RecvError::Lagged(
+                                    _,
+                                ),
+                            ) => {
+                                // The current client tokens are authoritative;
+                                // the next refresh notification will persist
+                                // their latest value.
+                            }
+                            Err(
+                                tokio::sync::broadcast::error::RecvError::Closed,
+                            ) => return,
+                        }
+                    }
+                }
+            }
+        });
+
+        let mut filter_failures = 0;
+        let filter = loop {
+            match client
+                .get_or_upload_filter("sync", Connection::sync_filter())
+                .await
+            {
+                Ok(filter) => break filter,
+                Err(error) if is_retryable_network_error(&error) => {
+                    let delay = sync_retry_delay(filter_failures);
+                    filter_failures = filter_failures.saturating_add(1);
+                    error!(
+                        "Matrix filter upload failed due to a network error, retrying in {}s: {error}",
+                        delay.as_secs()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => {
+                    let _ = channel
+                        .send(Err(format!(
+                            "Failed to upload Matrix sync filter: {error}"
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        };
+
+        let sync_token: Option<String> = None;
+        let sync_settings = SyncSettings::new()
+            .timeout(DEFAULT_SYNC_TIMEOUT)
+            .filter(Filter::FilterId(filter));
+
+        let sync_settings = if let Some(t) = sync_token {
+            sync_settings.token(t)
+        } else {
+            sync_settings
+        };
+
+        let sync_channel = &channel;
+
+        let client_ref = &client;
+
+        let mut sync_failures = 0;
+        loop {
+            let ret = client
+            .sync_with_callback(sync_settings.clone(), |response| async move {
+                for event in response.to_device.iter().filter_map(|e| e.to_raw().deserialize().ok()){
+                    if sync_channel
+                        .send(Ok(ClientMessage::ToDeviceEvent(event)))
+                        .await
+                        .is_err()
+                    {
+                        return LoopCtrl::Break;
+                    }
+                }
+
+                for (room_id, room) in response.rooms.joined {
+                    if let Some(room) = client_ref.get_room(&room_id) {
+                        Self::queue_room_metadata(
+                            sync_channel.clone(),
+                            room.clone(),
+                        );
+                    }
+                    let state_events = match &room.state {
+                        State::Before(state) | State::After(state) => state,
+                    };
+
+                    for event in
+                        state_events.iter().filter_map(|e| e.deserialize().ok())
+                    {
+                        if let AnySyncStateEvent::RoomMember(m) = event {
+                            let change = room
+                                .ambiguity_changes
+                                .get(m.event_id())
+                                .cloned();
+
+                            if sync_channel
+                                .send(Ok(ClientMessage::MemberEvent(
+                                    room_id.clone(),
+                                    m,
+                                    true,
+                                    change,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return LoopCtrl::Break;
+                            }
+                        } else if sync_channel
+                            .send(Ok(ClientMessage::SyncState(
+                                room_id.clone(),
+                                event,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            return LoopCtrl::Break;
+                        }
+                    }
+
+                    for event in room
+                        .ephemeral
+                        .iter()
+                        .filter_map(|e| e.deserialize().ok())
+                    {
+                        if sync_channel
+                            .send(Ok(ClientMessage::EphemeralRoomEvent(
+                                room_id.clone(),
+                                event,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            return LoopCtrl::Break;
+                        }
+                    }
+
+                    for event in room
+                        .timeline
+                        .events
+                        .iter()
+                        .filter_map(|e| e.raw().deserialize().ok())
+                    {
+                        if let AnySyncTimelineEvent::State(
+                            AnySyncStateEvent::RoomMember(m),
+                        ) = event
+                        {
+                            let change = room
+                                .ambiguity_changes
+                                .get(m.event_id())
+                                .cloned();
+
+                            if sync_channel
+                                .send(Ok(ClientMessage::MemberEvent(
+                                    room_id.clone(),
+                                    m,
+                                    false,
+                                    change,
+                                )))
+                                .await
+                                .is_err()
+                            {
+                                return LoopCtrl::Break;
+                            }
+                        } else if sync_channel
+                            .send(Ok(ClientMessage::SyncEvent(
+                                room_id.clone(),
+                                event,
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            return LoopCtrl::Break;
+                        }
+                    }
+
+                    if let Some(r) = client_ref.get_room(&room_id) {
+                        if !r.are_members_synced() {
+                            let room_id = room_id.clone();
+                            let channel = sync_channel.clone();
+
+                            tokio::spawn(async move {
+                                if let Ok(members) =
+                                    r.members(RoomMemberships::ACTIVE).await
+                                {
+                                    for member in members {
+                                        if let Err(e) = channel
+                                            .send(Ok(
+                                                ClientMessage::MemberEvent(
+                                                    room_id.clone(),
+                                                    member.event().as_sync().expect("Member event is not a StateSyncEvent").to_owned(),
+                                                    true,
+                                                    None,
+                                                ),
+                                            ))
+                                            .await
+                                        {
+                                            error!(
+                                                "Failed to send room member {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+
+                LoopCtrl::Continue
+            })
+            .await;
+
+            match ret {
+                Err(err) if channel.is_closed() => {
+                    error!("Matrix sync failed during shutdown: {err}");
+                    break;
+                }
+                Err(err) => {
+                    let delay = sync_retry_delay(sync_failures);
+                    sync_failures = sync_failures.saturating_add(1);
+                    error!(
+                        "Matrix sync failed, retrying in {}s: {err}",
+                        delay.as_secs()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(())
+                    if should_restart_completed_sync(channel.is_closed()) =>
+                {
+                    let delay = sync_retry_delay(sync_failures);
+                    sync_failures = sync_failures.saturating_add(1);
+                    error!(
+                        "Matrix sync stopped unexpectedly, restarting in {}s",
+                        delay.as_secs()
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Ok(()) => break,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn send_retries_are_bounded() {
+        assert_eq!(send_retry_delay(0), Some(Duration::from_secs(1)));
+        assert_eq!(send_retry_delay(3), Some(Duration::from_secs(10)));
+        assert_eq!(send_retry_delay(4), None);
+    }
+
+    #[test]
+    fn sync_retry_delay_is_capped() {
+        assert_eq!(sync_retry_delay(0), Duration::from_secs(1));
+        assert_eq!(sync_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(sync_retry_delay(6), Duration::from_secs(60));
+        assert_eq!(sync_retry_delay(31), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn completed_sync_restarts_unless_channel_is_closed() {
+        assert!(should_restart_completed_sync(false));
+        assert!(!should_restart_completed_sync(true));
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.as_ref().cloned() else {
+            return;
+        };
+
+        if Rc::strong_count(&runtime) == 1 {
+            self.stop_sync_task(&runtime);
+            self.stop_receiver_task(&runtime);
+        }
+
+        if let Some(client) = self.client.take() {
+            let _guard = runtime.enter();
+            drop(client);
+        }
+
+        if Rc::strong_count(&runtime) == 1 {
+            let runtime = self.runtime.take().expect("runtime disappeared");
+            let handle = runtime.handle().clone();
+            let _guard = handle.enter();
+            drop(runtime);
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_boundary_tests {
+    use std::{cell::RefCell, fs, path::Path, rc::Rc};
+
+    use tokio::runtime::Runtime;
+
+    use super::Connection;
+
+    fn rust_sources(path: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(path).expect("source directory is readable") {
+            let path = entry.expect("source entry is readable").path();
+            if path.is_dir() {
+                rust_sources(&path, files);
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "rs")
+            {
+                files.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn matrix_sdk_async_io_is_owned_by_connection_runtime() {
+        let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let connection = source_root.join("connection.rs");
+        let mut files = Vec::new();
+        rust_sources(&source_root, &mut files);
+
+        for path in files {
+            if path == connection {
+                continue;
+            }
+            let source =
+                fs::read_to_string(&path).expect("Rust source is readable");
+            let compact = source
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .collect::<String>();
+            for forbidden in [".state_store()", ".join_room_by_id("] {
+                assert!(
+                    !compact.contains(forbidden),
+                    "{} calls {forbidden} outside connection.rs; route Matrix SDK async I/O through Connection",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fallible_runtime_boundary_contains_task_panics() {
+        let runtime = Rc::new(Runtime::new().expect("test runtime starts"));
+        let connection = Connection {
+            receiver_task: Rc::new(RefCell::new(None)),
+            sync_task: Rc::new(RefCell::new(None)),
+            client: None,
+            runtime: Some(runtime.clone()),
+        };
+
+        let error =
+            runtime
+                .block_on(connection.try_spawn(async {
+                    panic!("simulated Matrix SDK task panic")
+                }))
+                .expect_err("task panic becomes an error");
+
+        assert!(error.contains("task") && error.contains("panicked"));
+    }
+}

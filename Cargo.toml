@@ -1,0 +1,72 @@
+[package]
+name = "weechat-matrix"
+version = "0.1.0"
+authors = ["Damir Jelić <poljar@termina.org.uk>"]
+edition = "2018"
+license = "ISC"
+resolver = "2"
+description = "WeeChat plugin for the Matrix protocol"
+
+[package.metadata.deb]
+name = "weechat-matrix-rs"
+maintainer = "Damir Jelić <poljar@termina.org.uk>"
+copyright = "2019-2024, Damir Jelić <poljar@termina.org.uk>"
+extended-description = """\
+WeeChat plugin for the Matrix protocol built with the Matrix Rust SDK.
+Provides native Matrix support within WeeChat, allowing you to chat
+on Matrix from your favourite IRC client."""
+section = "net"
+priority = "optional"
+depends = "$auto, weechat-plugins"
+assets = [
+    ["target/release/libmatrix.so",
+     "/usr/lib/x86_64-linux-gnu/weechat/plugins/matrix-rs.so",
+     "755"],
+]
+
+[lib]
+name = "matrix"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+
+[dependencies]
+clap = "2.34.0"
+base64 = "0.22"
+chrono = "0.4.22"
+dashmap = "6.1.0"
+url = "2.3.1"
+serde_json = "1.0.85"
+serde = { version = "1.0", features = ["derive"] }
+strum = { version = "0.24.0", features = ["derive"] }
+tokio = { version = "1.21.1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1.36"
+tracing-subscriber = { version = "0.3.15", features = ["env-filter"] }
+uuid = { version = "1.1.2", features = ["v4"] }
+unicode-segmentation = "1.10.0"
+futures-util = "0.3"
+ruma-html = { version = "0.8.0", features = ["matrix"] }
+
+# Auto-select version from matrix-sdk
+qrcode = { version = "*", default-features = false }
+image = { version = "*", default-features = false, features = ["jpeg"] }
+mime = "0.3"
+mime_guess = "2.0"
+sha2 = "0.10"
+
+[dependencies.weechat]
+git = "https://github.com/poljar/rust-weechat"
+features = ["async", "config_macro"]
+
+[build-dependencies.weechat-sys]
+git = "https://github.com/poljar/rust-weechat"
+
+[dependencies.matrix-sdk]
+version = "0.18.0"
+# git = "https://github.com/matrix-org/matrix-rust-sdk.git"
+# rev = "92192c549b3f53889c23954386743867a73b31b1"
+features = ["markdown", "socks", "qrcode", "sso-login"]
+
+[profile.dev.package]
+sha2 = { opt-level = 2 }

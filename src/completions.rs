@@ -1,0 +1,483 @@
+use std::{borrow::Cow, collections::BTreeSet};
+
+use matrix_sdk::ruma::MxcUri;
+
+use weechat::{
+    buffer::Buffer,
+    hooks::{
+        Completion, CompletionCallback, CompletionHook, CompletionPosition,
+    },
+    Weechat,
+};
+
+use crate::commands::is_buffer_target;
+use crate::commands::whois::{
+    matrix_member_completion_candidates, matrix_member_profiles,
+};
+use crate::Servers;
+
+#[allow(dead_code)]
+pub struct Completions {
+    buffer_short_names: CompletionHook,
+    servers: CompletionHook,
+    users: CompletionHook,
+    room_members: CompletionHook,
+    media: CompletionHook,
+    nicks: CompletionHook,
+}
+
+impl Completions {
+    pub fn hook_all(servers: Servers) -> Result<Self, ()> {
+        Ok(Self {
+            buffer_short_names: BufferShortNamesCompletion::create(
+                servers.clone(),
+            )?,
+            servers: ServersCompletion::create(servers.clone())?,
+            users: UsersCompletion::create(servers.clone())?,
+            room_members: RoomMembersCompletion::create()?,
+            media: MediaCompletion::create(servers.clone())?,
+            nicks: NicksCompletion::create(servers)?,
+        })
+    }
+}
+
+struct BufferShortNamesCompletion {
+    servers: Servers,
+}
+
+impl BufferShortNamesCompletion {
+    fn create(servers: Servers) -> Result<CompletionHook, ()> {
+        let comp = BufferShortNamesCompletion { servers };
+
+        // WeeChat's /buffer completion uses this item after adding its regular
+        // buffer names. Adding Matrix short names here keeps those core
+        // candidates intact while making the command-run hook reachable.
+        CompletionHook::new(
+            "buffers_names",
+            "Completion for Matrix buffer short names",
+            comp,
+        )
+    }
+}
+
+impl CompletionCallback for BufferShortNamesCompletion {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        _: &Buffer,
+        _: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        for short_name in buffer_completion_candidates(
+            self.servers
+                .borrow()
+                .values()
+                .flat_map(|server| server.rooms())
+                .flat_map(|room| room.buffer_short_names()),
+        ) {
+            completion.add_with_options(
+                &short_name,
+                false,
+                CompletionPosition::Sorted,
+            );
+        }
+
+        Ok(())
+    }
+}
+
+struct ServersCompletion {
+    servers: Servers,
+}
+
+impl ServersCompletion {
+    fn create(servers: Servers) -> Result<CompletionHook, ()> {
+        let comp = ServersCompletion { servers };
+
+        CompletionHook::new(
+            "matrix_servers",
+            "Completion for the list of added Matrix servers",
+            comp,
+        )
+    }
+}
+
+impl CompletionCallback for ServersCompletion {
+    fn callback(
+        &mut self,
+        _weechat: &Weechat,
+        _buffer: &Buffer,
+        _completion_name: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        for server_name in self.servers.borrow().keys() {
+            completion.add_with_options(
+                server_name,
+                false,
+                CompletionPosition::Sorted,
+            );
+        }
+        Ok(())
+    }
+}
+
+struct UsersCompletion {
+    servers: Servers,
+}
+
+impl UsersCompletion {
+    fn create(servers: Servers) -> Result<CompletionHook, ()> {
+        let comp = UsersCompletion { servers };
+
+        CompletionHook::new(
+            "matrix-users",
+            "Completion for the list of Matrix users",
+            comp,
+        )
+    }
+}
+
+impl CompletionCallback for UsersCompletion {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        buffer: &Buffer,
+        _: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        if let Some(server) = self.servers.find_server(buffer) {
+            if let Some(connection) = server.connection() {
+                let tracked_users = self
+                    .servers
+                    .runtime()
+                    .block_on(connection.client().encryption().tracked_users())
+                    .unwrap_or_else(|e| {
+                        tracing::warn!("Error getting tracked users: {e}");
+                        Default::default()
+                    });
+
+                for user in tracked_users.into_iter() {
+                    completion.add_with_options(
+                        user.as_str(),
+                        true,
+                        CompletionPosition::Sorted,
+                    )
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct RoomMembersCompletion;
+
+impl RoomMembersCompletion {
+    fn create() -> Result<CompletionHook, ()> {
+        CompletionHook::new(
+            "matrix-room-members",
+            "Completion for Matrix room members in the current buffer",
+            RoomMembersCompletion,
+        )
+    }
+}
+
+impl CompletionCallback for RoomMembersCompletion {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        buffer: &Buffer,
+        _: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        for candidate in
+            matrix_member_completion_candidates(&matrix_member_profiles(buffer))
+        {
+            completion.add_with_options(
+                &candidate,
+                true,
+                CompletionPosition::Sorted,
+            )
+        }
+
+        Ok(())
+    }
+}
+
+/// Feed room member nicks into WeeChat's built-in "nicks" completion.
+///
+/// Thread buffers keep an empty nicklist, so the built-in fallback of
+/// completing from the current buffer's nicklist finds no candidates
+/// there. Adding the parent room's members here makes nick completion
+/// work in thread buffers, while room buffers keep using the built-in
+/// nicklist completion (this hook adds nothing for them, so WeeChat
+/// falls back to it).
+struct NicksCompletion {
+    servers: Servers,
+}
+
+impl NicksCompletion {
+    fn create(servers: Servers) -> Result<CompletionHook, ()> {
+        let comp = NicksCompletion { servers };
+
+        CompletionHook::new(
+            "nick",
+            "Completion for Matrix room member nicks",
+            comp,
+        )
+    }
+}
+
+impl CompletionCallback for NicksCompletion {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        buffer: &Buffer,
+        _: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        let room_names = self
+            .servers
+            .find_room(buffer)
+            .map(|room| room.names())
+            .unwrap_or_default();
+
+        for nick in nick_completion_candidates(
+            buffer.get_localvar("thread_root").is_some(),
+            room_names,
+        ) {
+            completion.add_with_options(&nick, true, CompletionPosition::Sorted)
+        }
+
+        Ok(())
+    }
+}
+
+/// Nick completion candidates for the given matrix buffer context.
+///
+/// Only thread buffers contribute candidates (the parent room's members);
+/// every other buffer contributes nothing so WeeChat keeps using its
+/// built-in nicklist-based completion there.
+fn nick_completion_candidates(
+    is_thread_buffer: bool,
+    room_names: Vec<String>,
+) -> Vec<String> {
+    if !is_thread_buffer {
+        return Vec::new();
+    }
+    let mut names = room_names;
+    names.sort_unstable();
+    names
+}
+
+struct MediaCompletion {
+    servers: Servers,
+}
+
+impl MediaCompletion {
+    fn create(servers: Servers) -> Result<CompletionHook, ()> {
+        let comp = MediaCompletion { servers };
+
+        CompletionHook::new(
+            "matrix-media",
+            "Completion for Matrix media URIs in the current buffer",
+            comp,
+        )
+    }
+}
+
+impl CompletionCallback for MediaCompletion {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        buffer: &Buffer,
+        _: Cow<str>,
+        completion: &Completion,
+    ) -> Result<(), ()> {
+        if self.servers.find_server(buffer).is_none() {
+            return Ok(());
+        }
+
+        let mut media = BTreeSet::new();
+
+        for line in buffer.lines().rev().take(200) {
+            let message = Weechat::remove_color(&line.message());
+            media.extend(extract_mxc_uris(&message));
+        }
+
+        for uri in media {
+            completion.add_with_options(
+                &uri,
+                false,
+                CompletionPosition::Sorted,
+            );
+        }
+
+        Ok(())
+    }
+}
+
+fn extract_mxc_uris(message: &str) -> Vec<String> {
+    message
+        .match_indices("mxc://")
+        .filter_map(|(start, _)| {
+            let uri = message[start..]
+                .split(|c: char| {
+                    c.is_whitespace()
+                        || matches!(
+                            c,
+                            '<' | '>' | '[' | ']' | '(' | ')' | '"' | '\''
+                        )
+                })
+                .next()
+                .unwrap_or_default();
+            let uri = uri.trim_end_matches(|c: char| {
+                !(c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            });
+            let uri = <&MxcUri>::from(uri);
+
+            if uri.is_valid() && uri.media_id().is_ok_and(|id| !id.is_empty()) {
+                Some(uri.as_str().to_owned())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn buffer_completion_candidates<I>(short_names: I) -> BTreeSet<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    short_names
+        .into_iter()
+        .filter(|short_name| is_buffer_target(short_name))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_valid_mxc_uris() {
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris(
+                "authenticated download: /matrix media download \
+                 mxc://matrix.org/some-media-id [file]"
+            )
+        );
+    }
+
+    #[test]
+    fn ignores_invalid_mxc_uris() {
+        assert!(extract_mxc_uris("download mxc://").is_empty());
+    }
+
+    #[test]
+    fn extracts_uris_followed_by_sentence_punctuation() {
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("look at mxc://matrix.org/some-media-id."),
+        );
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("see mxc://matrix.org/some-media-id, then reply"),
+        );
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("is it mxc://matrix.org/some-media-id?"),
+        );
+    }
+
+    #[test]
+    fn extracts_uris_wrapped_in_delimiters() {
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("(mxc://matrix.org/some-media-id)"),
+        );
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("[mxc://matrix.org/some-media-id]"),
+        );
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("\"mxc://matrix.org/some-media-id\""),
+        );
+        assert_eq!(
+            vec!["mxc://matrix.org/some-media-id".to_owned()],
+            extract_mxc_uris("<mxc://matrix.org/some-media-id>"),
+        );
+    }
+
+    #[test]
+    fn extracts_multiple_uris_from_a_single_line() {
+        assert_eq!(
+            vec![
+                "mxc://a.example.org/one".to_owned(),
+                "mxc://b.example.org/two".to_owned(),
+            ],
+            extract_mxc_uris(
+                "first mxc://a.example.org/one, then mxc://b.example.org/two."
+            ),
+        );
+    }
+
+    #[test]
+    fn drops_uris_without_a_media_id() {
+        assert!(extract_mxc_uris("download mxc://matrix.org/").is_empty());
+    }
+
+    #[test]
+    fn completes_only_resolvable_matrix_short_names() {
+        assert_eq!(
+            buffer_completion_candidates([
+                "#matrix:example.org".to_owned(),
+                "#matrix:example.org".to_owned(),
+                "".to_owned(),
+                "matrix room".to_owned(),
+                "list".to_owned(),
+            ]),
+            BTreeSet::from(["#matrix:example.org".to_owned()]),
+        );
+    }
+
+    #[test]
+    fn thread_buffers_contribute_sorted_room_member_nicks() {
+        assert_eq!(
+            nick_completion_candidates(
+                true,
+                vec![
+                    "Bob".to_owned(),
+                    "Alice".to_owned(),
+                    "Ada (ada@example.org)".to_owned(),
+                ],
+            ),
+            vec![
+                "Ada (ada@example.org)".to_owned(),
+                "Alice".to_owned(),
+                "Bob".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn thread_buffers_without_a_room_contribute_nothing() {
+        assert_eq!(
+            nick_completion_candidates(true, vec![]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn non_thread_buffers_keep_the_builtin_nicklist_completion() {
+        assert_eq!(
+            nick_completion_candidates(
+                false,
+                vec!["Alice".to_owned(), "Bob".to_owned(),],
+            ),
+            Vec::<String>::new(),
+        );
+    }
+}

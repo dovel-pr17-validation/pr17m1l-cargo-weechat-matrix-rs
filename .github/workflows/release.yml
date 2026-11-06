@@ -1,0 +1,99 @@
+on: [push, pull_request]
+
+name: build-test-release
+
+jobs:
+  publish:
+    name: Publish for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04, ubuntu-latest]
+        include:
+          - os: ubuntu-22.04
+            artifact_name: libmatrix.so
+            asset_name: libmatrix.so-ubuntu-22.04
+          - os: ubuntu-24.04
+            artifact_name: libmatrix.so
+            asset_name: libmatrix.so-ubuntu-24.04
+          - os: ubuntu-latest # currently 24.04
+            artifact_name: libmatrix.so
+            asset_name: libmatrix.so-ubuntu-latest
+        rust:
+          - stable
+      fail-fast: false
+
+    steps:
+      - name: Install latest-stable weechat for Ubuntu
+        id: build_env
+        run: |
+          sudo apt update
+          sudo apt install dirmngr gpg-agent apt-transport-https
+          sudo apt-key adv --keyserver hkps://keys.openpgp.org --recv-keys 11E9DE8848F2B65222AA75B8D1820DB22A11534E
+          echo "deb https://weechat.org/ubuntu $(lsb_release -c | awk '{ print $NF }') main" | sudo tee /etc/apt/sources.list.d/weechat.list
+          echo "deb-src https://weechat.org/ubuntu $(lsb_release -c | awk '{ print $NF }') main" | sudo tee -a /etc/apt/sources.list.d/weechat.list
+          sudo apt update
+          sudo apt install weechat-curses weechat-plugins weechat-python weechat-perl weechat-dev
+          echo "version of weechat-plugin.h that weechat-sys uses by default:"
+          grep -m 1 -n -H "WEECHAT_PLUGIN_API_VERSION" "/usr/include/weechat/weechat-plugin.h"
+          v="$(grep -m 1 -o  'WEECHAT_PLUGIN_API_VERSION.*' '/usr/include/weechat/weechat-plugin.h')"
+          echo "W_API_V=$v" >> $GITHUB_OUTPUT
+
+      - name: Install sqlite3 libraries
+        run: |
+          sudo apt install libsqlite3-dev
+
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup update --no-self-update
+          rustup default stable
+
+      - name: Run cargo build
+        run: cargo build --release
+
+      - name: Run cargo test
+        run: cargo test --release
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: 'libmatrix.so-${{ matrix.os }}'
+          path: target/release/libmatrix.so
+
+  publish-deb:
+    name: Publish .deb for Debian 13 (trixie)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y ca-certificates curl gnupg apt-transport-https build-essential pkg-config libssl-dev libsqlite3-dev libclang-dev git
+          apt-get install -y weechat-curses weechat-plugins weechat-python weechat-perl weechat-dev
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          # rustup isn't on PATH yet in this step, use full path
+          "$HOME/.cargo/bin/rustup" default stable
+      - name: Checkout sources
+        uses: actions/checkout@v4
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+      - name: Build .deb package
+        run: make deb
+      - name: Find .deb artifact
+        id: deb_artifact
+        run: |
+          deb_file=$(ls target/debian/weechat-matrix-rs_*.deb)
+          echo "path=$deb_file" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$deb_file" .deb)" >> "$GITHUB_OUTPUT"
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.deb_artifact.outputs.name }}
+          path: ${{ steps.deb_artifact.outputs.path }}

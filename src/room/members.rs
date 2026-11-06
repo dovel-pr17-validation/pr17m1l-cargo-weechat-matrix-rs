@@ -1,0 +1,821 @@
+use std::{cell::RefCell, rc::Rc};
+
+use dashmap::DashMap;
+use tokio::runtime::Handle;
+use tracing::{debug, error, info};
+
+use matrix_sdk::{
+    deserialized_responses::AmbiguityChange,
+    room::RoomMember,
+    ruma::{
+        events::{
+            room::{
+                member::{MembershipState, RoomMemberEventContent},
+                power_levels::UserPowerLevel,
+            },
+            SyncStateEvent,
+        },
+        uint, Int, MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
+    },
+};
+
+use weechat::{
+    buffer::{Buffer, NickSettings},
+    Prefix, Weechat,
+};
+
+use crate::{
+    config::Config,
+    render::render_membership,
+    room::{active_room, buffer::RoomBuffer, SharedRoom},
+};
+
+#[derive(Clone)]
+pub struct Members {
+    room: SharedRoom,
+    pub(super) runtime: Handle,
+    ambiguity_map: Rc<DashMap<OwnedUserId, bool>>,
+    nicks: Rc<DashMap<OwnedUserId, String>>,
+    profiles: Rc<DashMap<OwnedUserId, MatrixMemberProfile>>,
+    last_active: Rc<DashMap<OwnedUserId, MilliSecondsSinceUnixEpoch>>,
+    config: Rc<RefCell<Config>>,
+    buffer: RoomBuffer,
+}
+
+const MEMBER_PROFILE_LIMIT: usize = 512;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MatrixMemberProfile {
+    user_id: String,
+    display_name: String,
+    nick: String,
+    membership: String,
+    role: String,
+    power_level: Option<i64>,
+    avatar_mxc: Option<String>,
+}
+
+fn bounded_member_profiles(
+    mut profiles: Vec<MatrixMemberProfile>,
+) -> Vec<MatrixMemberProfile> {
+    profiles.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then_with(|| left.user_id.cmp(&right.user_id))
+    });
+    profiles.truncate(MEMBER_PROFILE_LIMIT);
+    profiles
+}
+
+fn resolved_room_avatar_mxc(
+    explicit_room_avatar: Option<String>,
+    is_direct: bool,
+    own_user_id: &str,
+    profiles: &[MatrixMemberProfile],
+) -> Option<String> {
+    if explicit_room_avatar.is_some() || !is_direct {
+        return explicit_room_avatar;
+    }
+
+    let mut joined_peers = profiles.iter().filter(|profile| {
+        profile.membership == MembershipState::Join.as_str()
+            && profile.user_id != own_user_id
+    });
+    let peer = joined_peers.next()?;
+
+    // An m.direct room is not necessarily a two-person conversation. Avoid
+    // assigning one arbitrary member's face to a multi-user direct room.
+    if joined_peers.next().is_some() {
+        return None;
+    }
+
+    peer.avatar_mxc.clone()
+}
+
+#[derive(Clone, Debug)]
+pub struct WeechatRoomMember {
+    inner: RoomMember,
+    color: Rc<String>,
+    prefix_color: Rc<String>,
+    ambiguous_nick: Rc<bool>,
+    nick: Rc<String>,
+}
+
+impl PartialEq for WeechatRoomMember {
+    fn eq(&self, other: &Self) -> bool {
+        self.user_id() == other.user_id()
+    }
+}
+
+impl Members {
+    pub fn new(
+        room: SharedRoom,
+        runtime: Handle,
+        config: Rc<RefCell<Config>>,
+        buffer: RoomBuffer,
+    ) -> Self {
+        Self {
+            room,
+            runtime,
+            nicks: DashMap::new().into(),
+            profiles: DashMap::new().into(),
+            ambiguity_map: DashMap::new().into(),
+            last_active: DashMap::new().into(),
+            config,
+            buffer,
+        }
+    }
+
+    fn add_nick(&self, buffer: &Buffer, member: &WeechatRoomMember) {
+        let nick = member.nick();
+
+        let group = buffer
+            .search_nicklist_group(member.nicklist_group_name())
+            .expect("No group found when adding member");
+
+        let nick_settings = NickSettings::new(&nick)
+            .set_color(member.color())
+            .set_prefix(member.nicklist_prefix())
+            .set_prefix_color(member.prefix_color());
+
+        info!("Inserting nick {} for room {}", nick, buffer.short_name());
+
+        if group.add_nick(nick_settings).is_err() {
+            debug!(
+                "Nick {} ({}) is already present in room {}, skipping duplicate insert.",
+                nick,
+                member.user_id(),
+                buffer.short_name()
+            );
+        };
+
+        self.nicks.insert(member.user_id().to_owned(), nick);
+    }
+
+    pub(super) fn update_member_localvars(&self) {
+        let mut candidates: Vec<_> = self
+            .nicks
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "display_name": entry.value(),
+                    "user_id": entry.key().as_str(),
+                })
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            left["display_name"]
+                .as_str()
+                .unwrap_or_default()
+                .to_lowercase()
+                .cmp(
+                    &right["display_name"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_lowercase(),
+                )
+        });
+
+        if let Ok(buffer) = self.buffer.buffer_handle().upgrade() {
+            if let Ok(json) = serde_json::to_string(&candidates) {
+                buffer.set_localvar("matrix_mentions", &json);
+            }
+
+            let profiles: Vec<_> = self
+                .profiles
+                .iter()
+                .map(|entry| entry.value().clone())
+                .collect();
+            let profiles = bounded_member_profiles(profiles);
+            let room = active_room(&self.room);
+            let room_avatar = resolved_room_avatar_mxc(
+                room.avatar_url().map(|uri| uri.as_str().to_owned()),
+                buffer
+                    .get_localvar("type")
+                    .is_some_and(|kind| kind == "private"),
+                room.own_user_id().as_str(),
+                &profiles,
+            );
+            buffer.set_localvar(
+                "matrix_avatar_mxc",
+                room_avatar.as_deref().unwrap_or_default(),
+            );
+            let profiles: Vec<_> = profiles
+                .into_iter()
+                .map(|profile| {
+                    serde_json::json!({
+                        "user_id": profile.user_id,
+                        "display_name": profile.display_name,
+                        "nick": profile.nick,
+                        "membership": profile.membership,
+                        "role": profile.role,
+                        "power_level": profile.power_level,
+                        "avatar_mxc": profile.avatar_mxc,
+                    })
+                })
+                .collect();
+            if let Ok(json) = serde_json::to_string(&profiles) {
+                buffer.set_localvar("matrix_members_v1", &json);
+            }
+        }
+    }
+
+    fn weechat_member(&self, member: RoomMember) -> WeechatRoomMember {
+        let user_id = member.user_id();
+        let sdk_room = active_room(&self.room);
+        let color = if sdk_room.own_user_id() == user_id {
+            "weechat.color.chat_nick_self".into()
+        } else {
+            Weechat::info_get("nick_color_name", user_id.as_str())
+                .expect("Couldn't get the nick color name")
+        };
+
+        WeechatRoomMember {
+            prefix_color: Rc::new(Self::prefix_color_for_power_level(
+                &self.config.borrow(),
+                member.normalized_power_level(),
+            )),
+            color: Rc::new(color),
+            ambiguous_nick: Rc::new(
+                self.ambiguity_map
+                    .get(member.user_id())
+                    .map(|a| *a)
+                    .unwrap_or(false),
+            ),
+            nick: Rc::new(format_member_nick(
+                &self.config.borrow().look().nick_format(),
+                member.user_id(),
+                member.name(),
+                member.name_ambiguous(),
+            )),
+            inner: member,
+        }
+    }
+
+    async fn fetch_member(&self, user_id: &UserId) -> Option<RoomMember> {
+        let room = active_room(&self.room);
+        let user = user_id.to_owned();
+
+        match self
+            .runtime
+            .spawn(async move { room.get_member_no_sync(&user).await })
+            .await
+            .expect("Fetching the room member from the store panicked")
+        {
+            Ok(member) => member,
+            Err(e) => {
+                Weechat::print(&format!(
+                    "{}: Error fetching a room member from the store: {}",
+                    Weechat::prefix(Prefix::Error),
+                    e,
+                ));
+                None
+            }
+        }
+    }
+
+    fn update_member_from_room_member(&self, member: RoomMember) {
+        let buffer = self.buffer.buffer_handle();
+
+        let buffer = if let Ok(b) = buffer.upgrade() {
+            b
+        } else {
+            return;
+        };
+
+        if let Some(nick) = self.nicks.get(member.user_id()) {
+            buffer.remove_nick(&nick);
+        }
+
+        let member = self.weechat_member(member);
+        self.profiles
+            .insert(member.user_id().to_owned(), member.profile());
+        self.add_nick(&buffer, &member);
+    }
+
+    pub async fn restore_member(&self, user_id: OwnedUserId) {
+        match self.fetch_member(&user_id).await {
+            Some(member) => {
+                self.ambiguity_map
+                    .insert(user_id.to_owned(), member.name_ambiguous());
+                self.update_member_from_room_member(member);
+            }
+            None => {
+                panic!(
+                    "Couldn't find member {} in {}",
+                    user_id,
+                    self.buffer.short_name()
+                )
+            }
+        }
+    }
+
+    pub async fn update_member(&self, user_id: &UserId) {
+        let member = self.fetch_member(user_id).await.unwrap_or_else(|| {
+            panic!(
+                "Couldn't find member {} in {}",
+                user_id,
+                self.buffer.short_name()
+            )
+        });
+
+        self.update_member_from_room_member(member);
+    }
+
+    /// Add a new Weechat room member.
+    pub async fn add_or_modify(
+        &self,
+        user_id: &UserId,
+        ambiguity_change: Option<&AmbiguityChange>,
+    ) {
+        if let Some(change) = ambiguity_change {
+            self.ambiguity_map
+                .insert(user_id.to_owned(), change.member_ambiguous);
+
+            if let Some(disambiguated) = &change.disambiguated_member {
+                self.ambiguity_map.insert(disambiguated.clone(), false);
+                self.update_member(disambiguated).await;
+            }
+
+            if let Some(ambiguated) = &change.ambiguated_member {
+                self.ambiguity_map.insert(ambiguated.clone(), true);
+                self.update_member(ambiguated).await;
+            }
+        }
+
+        self.update_member(user_id).await;
+        self.update_member_localvars();
+    }
+
+    /// Remove a Weechat room member by user ID.
+    ///
+    /// Returns either the removed Weechat room member, or an error if the
+    /// member does not exist.
+    async fn remove(
+        &self,
+        user_id: &UserId,
+        ambiguity_change: Option<&AmbiguityChange>,
+    ) {
+        self.ambiguity_map.remove(user_id);
+
+        if let Some(change) = ambiguity_change {
+            if let Some(disambiguated) = &change.disambiguated_member {
+                self.ambiguity_map.insert(disambiguated.clone(), false);
+                self.update_member(disambiguated).await;
+            }
+
+            if let Some(ambiguated) = &change.ambiguated_member {
+                self.ambiguity_map.insert(ambiguated.clone(), true);
+                self.update_member(ambiguated).await;
+            }
+        }
+
+        let buffer = self.buffer.buffer_handle();
+
+        let buffer = if let Ok(b) = buffer.upgrade() {
+            b
+        } else {
+            return;
+        };
+
+        if let Some((_, nick)) = self.nicks.remove(user_id) {
+            buffer.remove_nick(&nick);
+        }
+        self.profiles.remove(user_id);
+        self.update_member_localvars();
+    }
+
+    /// Retrieve a reference to a Weechat room member by user ID.
+    pub async fn get(&self, user_id: &UserId) -> Option<WeechatRoomMember> {
+        let member = self.fetch_member(user_id).await?;
+
+        Some(self.weechat_member(member))
+    }
+
+    fn prefix_color_for_power_level(
+        config: &Config,
+        power_level: UserPowerLevel,
+    ) -> String {
+        let color = config.color();
+
+        match power_level {
+            UserPowerLevel::Infinite => color.nick_prefix_admin(),
+            p if p >= Int::from(100) => color.nick_prefix_admin(),
+            p if p >= Int::from(50) => color.nick_prefix_moderator(),
+            p if p > Int::from(0) => color.nick_prefix_power(),
+            _ => "default".to_owned(),
+        }
+    }
+
+    pub fn mark_active(
+        &self,
+        user_id: &UserId,
+        timestamp: MilliSecondsSinceUnixEpoch,
+    ) {
+        if self
+            .last_active
+            .get(user_id)
+            .map(|last_active| last_active.0 >= timestamp.0)
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        self.last_active.insert(user_id.to_owned(), timestamp);
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<_> = self
+            .nicks
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        names.sort_unstable();
+        names
+    }
+
+    fn should_smart_filter(
+        &self,
+        user_id: &UserId,
+        timestamp: MilliSecondsSinceUnixEpoch,
+        smart_filter_delay_ms: i64,
+    ) -> bool {
+        let Some(last_active) = self.last_active.get(user_id) else {
+            return true;
+        };
+
+        let inactive_ms: i64 = timestamp.0.saturating_sub(last_active.0).into();
+
+        inactive_ms > smart_filter_delay_ms
+    }
+
+    pub async fn handle_membership_event(
+        &self,
+        event: &SyncStateEvent<RoomMemberEventContent>,
+        state_event: bool,
+        ambiguity_change: Option<&AmbiguityChange>,
+        smart_filter_delay_ms: i64,
+    ) {
+        let buffer = self.buffer.buffer_handle();
+        let buffer = if let Ok(b) = buffer.upgrade() {
+            b
+        } else {
+            return;
+        };
+
+        let event = match event {
+            SyncStateEvent::Original(e) => e,
+            SyncStateEvent::Redacted(e) => {
+                error!("Unhandled redacted event: {e:?}");
+                return;
+            }
+        };
+
+        info!(
+            "Handling membership event for room {} {} {:?}",
+            buffer.short_name(),
+            event.state_key,
+            event.content.membership
+        );
+
+        let sender_id = event.sender.clone();
+
+        let target_id = if let Ok(t) = UserId::parse(event.state_key.clone()) {
+            t
+        } else {
+            error!(
+                "Invalid state key in room {} from sender {}: {}",
+                buffer.short_name(),
+                event.sender,
+                event.state_key,
+            );
+            return;
+        };
+
+        use MembershipState::*;
+
+        // For joins and invites, first we need to check whether a member
+        // with some MXID exists. If he does, we have to update *that*
+        // member with the new state. Only if they do not exist yet do we
+        // create a new one.
+        //
+        // For leaves and bans we just need to remove the member.
+        match event.content.membership {
+            Invite | Join => {
+                self.add_or_modify(&target_id, ambiguity_change).await
+            }
+            Leave | Ban => self.remove(&target_id, ambiguity_change).await,
+            _ => (),
+        };
+
+        // Names of rooms without display names can get affected by the
+        // member list so we need to update them.
+        self.buffer.update_buffer_name();
+
+        if !state_event {
+            let sender = self.get(&sender_id).await;
+            let target = self.get(&target_id).await;
+
+            // Display the event message
+            let line = match (&sender, &target) {
+                (Some(sender), Some(target)) => {
+                    render_membership(event, sender, target)
+                }
+
+                _ => {
+                    if sender.is_none() {
+                        error!(
+                            "Cannot render event since event sender {} is not a room member",
+                            sender_id);
+                    }
+
+                    if target.is_none() {
+                        error!(
+                            "Cannot render event since event target {} is not a room member",
+                            target_id);
+                    }
+
+                    crate::render::RenderedLine {
+                        tags: vec!["matrix_membership".to_owned()],
+                        message: "ERROR: cannot render event since sender or target are not a room member".into(),
+                    }
+                }
+            };
+
+            let timestamp: i64 =
+                (event.origin_server_ts.0 / uint!(1000)).into();
+            let mut tags = line.tags;
+
+            if self.should_smart_filter(
+                &target_id,
+                event.origin_server_ts,
+                smart_filter_delay_ms,
+            ) {
+                tags.push("matrix_smart_filter".to_owned());
+            }
+
+            let tags: Vec<&str> = tags.iter().map(|t| t.as_str()).collect();
+            buffer.print_date_tags(timestamp as isize, &tags, &line.message);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile(index: usize, display_name: &str) -> MatrixMemberProfile {
+        MatrixMemberProfile {
+            user_id: format!("@user{index}:example.org"),
+            display_name: display_name.to_owned(),
+            nick: display_name.to_owned(),
+            membership: "join".to_owned(),
+            role: "member".to_owned(),
+            power_level: Some(0),
+            avatar_mxc: Some(format!("mxc://example.org/avatar{index}")),
+        }
+    }
+
+    #[test]
+    fn profile_export_is_sorted_and_bounded() {
+        let profiles = (0..MEMBER_PROFILE_LIMIT + 20)
+            .rev()
+            .map(|index| profile(index, &format!("Member {index:04}")))
+            .collect();
+        let profiles = bounded_member_profiles(profiles);
+        assert_eq!(profiles.len(), MEMBER_PROFILE_LIMIT);
+        assert_eq!(profiles.first().unwrap().display_name, "Member 0000");
+        assert_eq!(profiles.last().unwrap().display_name, "Member 0511");
+    }
+
+    #[test]
+    fn explicit_room_avatar_wins_for_rooms_and_direct_chats() {
+        let profiles = vec![profile(1, "Peer")];
+        let explicit = Some("mxc://example.org/room-avatar".to_owned());
+
+        assert_eq!(
+            resolved_room_avatar_mxc(
+                explicit.clone(),
+                false,
+                "@me:example.org",
+                &profiles,
+            ),
+            explicit,
+        );
+    }
+
+    #[test]
+    fn one_to_one_direct_chat_uses_the_other_members_avatar() {
+        let mut own = profile(0, "Me");
+        own.user_id = "@me:example.org".to_owned();
+        own.avatar_mxc = Some("mxc://example.org/me".to_owned());
+        let peer = profile(1, "Peer");
+
+        assert_eq!(
+            resolved_room_avatar_mxc(
+                None,
+                true,
+                "@me:example.org",
+                &[own, peer],
+            )
+            .as_deref(),
+            Some("mxc://example.org/avatar1"),
+        );
+    }
+
+    #[test]
+    fn multi_user_direct_room_does_not_choose_an_arbitrary_avatar() {
+        let mut own = profile(0, "Me");
+        own.user_id = "@me:example.org".to_owned();
+
+        assert_eq!(
+            resolved_room_avatar_mxc(
+                None,
+                true,
+                "@me:example.org",
+                &[own, profile(1, "One"), profile(2, "Two")],
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn nick_format_defaults_to_display_name_with_ambiguity_suffix() {
+        let user_id = UserId::parse("@ada:example.org").unwrap();
+
+        assert_eq!(format_member_nick("%d", &user_id, "Ada", false), "Ada");
+        assert_eq!(
+            format_member_nick("%d", &user_id, "Ada", true),
+            "Ada (@ada:example.org)"
+        );
+    }
+
+    #[test]
+    fn nick_format_exposes_mxid_parts() {
+        let user_id = UserId::parse("@ada:example.org").unwrap();
+
+        assert_eq!(
+            format_member_nick("%u (%d) @ %h", &user_id, "Ada", true),
+            "ada (Ada) @ example.org"
+        );
+        assert_eq!(
+            format_member_nick("%m", &user_id, "Ada", true),
+            "@ada:example.org"
+        );
+    }
+
+    #[test]
+    fn nick_format_keeps_unknown_placeholders_literal() {
+        let user_id = UserId::parse("@ada:example.org").unwrap();
+
+        assert_eq!(
+            format_member_nick("%d %% %x %", &user_id, "Ada", false),
+            "Ada % %x %"
+        );
+    }
+}
+
+impl WeechatRoomMember {
+    fn profile(&self) -> MatrixMemberProfile {
+        let power_level = match self.inner.power_level() {
+            UserPowerLevel::Infinite => None,
+            UserPowerLevel::Int(level) => Some(level.into()),
+            _ => None,
+        };
+        MatrixMemberProfile {
+            user_id: self.user_id().as_str().to_owned(),
+            display_name: self.inner.name().to_owned(),
+            nick: self.nick(),
+            membership: self.inner.membership().as_str().to_owned(),
+            role: self.role().to_owned(),
+            power_level,
+            avatar_mxc: self
+                .inner
+                .avatar_url()
+                .map(|uri| uri.as_str().to_owned()),
+        }
+    }
+
+    pub fn user_id(&self) -> &UserId {
+        self.inner.user_id()
+    }
+
+    pub fn display_name(&self) -> Option<&str> {
+        self.inner.display_name()
+    }
+
+    pub fn color(&self) -> &str {
+        &self.color
+    }
+
+    fn nick_raw(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn nicklist_group_name(&self) -> &str {
+        match self.inner.normalized_power_level() {
+            UserPowerLevel::Infinite => "000|o",
+            p if p >= Int::from(100) => "000|o",
+            p if p >= Int::from(50) => "001|h",
+            p if p > Int::from(0) => "002|v",
+            _ => "999|...",
+        }
+    }
+
+    fn role(&self) -> &'static str {
+        match self.inner.normalized_power_level() {
+            UserPowerLevel::Infinite => "admin",
+            p if p >= Int::from(100) => "admin",
+            p if p >= Int::from(50) => "moderator",
+            p if p > Int::from(0) => "power user",
+            _ => "member",
+        }
+    }
+
+    fn nicklist_prefix(&self) -> &str {
+        match self.inner.normalized_power_level() {
+            UserPowerLevel::Infinite => "&",
+            p if p >= Int::from(100) => "&",
+            p if p >= Int::from(50) => "@",
+            p if p > Int::from(0) => "+",
+            _ => " ",
+        }
+    }
+
+    fn prefix(&self) -> &str {
+        self.nicklist_prefix().trim()
+    }
+
+    fn prefix_color(&self) -> &str {
+        &self.prefix_color
+    }
+
+    pub fn nick_colored(&self) -> String {
+        let default_ambiguous_nick =
+            format!("{} ({})", self.nick_raw(), self.user_id());
+        if *self.ambiguous_nick && self.nick.as_ref() == &default_ambiguous_nick
+        {
+            // TODO: this should color the parenthesis differently.
+            format!(
+                "{}{}{} ({})",
+                Weechat::color(self.color()),
+                self.nick_raw(),
+                Weechat::color("reset"),
+                self.user_id(),
+            )
+        } else {
+            format!(
+                "{}{}{}{}{}",
+                Weechat::color(self.prefix_color()),
+                self.prefix(),
+                Weechat::color(self.color()),
+                self.nick(),
+                Weechat::color("reset")
+            )
+        }
+    }
+
+    pub fn nick(&self) -> String {
+        self.nick.as_ref().to_owned()
+    }
+}
+
+fn format_member_nick(
+    format: &str,
+    user_id: &UserId,
+    display_name: &str,
+    ambiguous_display_name: bool,
+) -> String {
+    let localpart = user_id.localpart();
+    let homeserver = user_id.server_name().as_str();
+
+    let mut formatted =
+        String::with_capacity(format.len() + display_name.len());
+    let mut chars = format.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            formatted.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('d') => formatted.push_str(display_name),
+            Some('m') => formatted.push_str(user_id.as_str()),
+            Some('u') => formatted.push_str(localpart),
+            Some('h') => formatted.push_str(homeserver),
+            Some('%') => formatted.push('%'),
+            Some(other) => {
+                formatted.push('%');
+                formatted.push(other);
+            }
+            None => formatted.push('%'),
+        }
+    }
+
+    if ambiguous_display_name && format == "%d" {
+        format!("{} ({})", formatted, user_id)
+    } else {
+        formatted
+    }
+}

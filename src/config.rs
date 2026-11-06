@@ -1,0 +1,380 @@
+//! Configuration module
+//!
+//! This is the global plugin configuration.
+//!
+//! Configuration options should be split out into different sections:
+//!
+//! * network
+//! * look
+//! * color
+//! * server
+//!
+//! The server config options are added in the server.rs file.
+//!
+//! The config options created here will be alive as long as the plugin is
+//! loaded so they don't need to be freed manually. The drop implementation of
+//! the section will do so.
+
+use std::{
+    cell::{Ref, RefCell, RefMut},
+    rc::Rc,
+};
+
+use strum::{EnumVariantNames, VariantNames};
+use weechat::{
+    config,
+    config::{
+        Conf, ConfigOption, ConfigSection, ConfigSectionSettings,
+        OptionChanged, SectionReadCallback,
+    },
+    Weechat,
+};
+
+#[cfg(weechat410)]
+use weechat::config::IntegerOptionSettings;
+
+#[cfg(not(weechat410))]
+use weechat::config::EnumOptionSettings;
+
+use crate::{MatrixServer, Servers};
+
+#[derive(EnumVariantNames)]
+#[strum(serialize_all = "kebab_case")]
+#[derive(Default)]
+pub enum RedactionStyle {
+    #[default]
+    StrikeThrough,
+    Delete,
+    Notice,
+}
+
+impl From<i32> for RedactionStyle {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => RedactionStyle::StrikeThrough,
+            1 => RedactionStyle::Delete,
+            2 => RedactionStyle::Notice,
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[derive(EnumVariantNames)]
+#[strum(serialize_all = "kebab_case")]
+#[derive(Default)]
+pub enum ServerBuffer {
+    #[default]
+    MergeWithCore,
+    MergeWithoutCore,
+    Independent,
+}
+
+impl From<i32> for ServerBuffer {
+    fn from(value: i32) -> Self {
+        match value {
+            0 => ServerBuffer::MergeWithCore,
+            1 => ServerBuffer::MergeWithoutCore,
+            2 => ServerBuffer::Independent,
+            _ => unreachable!(),
+        }
+    }
+}
+
+config!(
+    "matrix-rust",
+
+    Section look {
+        encrypted_room_sign: String {
+            // Description.
+            "A sign that is used to show that the current room is encrypted",
+            // Default value.
+            "🔒",
+        },
+
+        encryption_warning_sign: String {
+            // Description.
+            "A sign that is used to show that the current room contains unverified devices",
+            // Default value.
+            "❗",
+        },
+
+        public_room_sign: String {
+            // Description.
+            "A sign indicating that the current room is public",
+            // Default value.
+            "🌍",
+        },
+
+        busy_sign: String {
+            // Description.
+            "A sign that is used to show that the client is busy, \
+                e.g. when room history is being fetched",
+            // Default value.
+            "⏳",
+        },
+
+        local_echo: bool {
+            // Description
+            "Should the sending message be printed out before the server \
+             confirms the reception of the message",
+             // Default value
+             true,
+        },
+
+        redaction_style: Enum {
+            // Description
+            "The style that should be used when a message needs to be redacted",
+            RedactionStyle,
+        },
+
+        smart_filter_delay: Integer {
+            // Description
+            "How long a room member can be inactive, in milliseconds, before \
+             membership events from them get the matrix_smart_filter tag",
+            // Default value.
+            300000,
+            // Range: 0 ms to one day.
+            0..86400000,
+        },
+
+        reply_full_quote_threshold: Integer {
+            // Description
+            "Render replies to recently printed events on one line when this \
+             value is positive. The default 0 keeps the Matrix reply fallback \
+             quote when available",
+            // Default value.
+            0,
+            // Range: quote-preserving default to a large scrollback window.
+            0..100000,
+        },
+
+        nick_format: String {
+            // Description.
+            "Format for Matrix member nicks. Supported placeholders: %d for \
+             display name, %m for full MXID, %u for MXID localpart, and %h \
+             for MXID homeserver",
+            // Default value.
+            "%d",
+        },
+    },
+
+    Section color {
+        nick_prefix_admin: Color {
+            // Description.
+            "Color for the admin nick prefix (&)",
+            // Default value.
+            "lightgreen",
+        },
+
+        nick_prefix_moderator: Color {
+            // Description.
+            "Color for the moderator nick prefix (@)",
+            // Default value.
+            "lightmagenta",
+        },
+
+        nick_prefix_power: Color {
+            // Description.
+            "Color for the nick prefix (+) used by users with a non-default \
+             power level below moderator",
+            // Default value.
+            "yellow",
+        },
+    },
+
+    Section network {
+        debug_buffer: bool {
+            // Description
+            "Use a separate buffer for debug logs",
+            // Default value.
+            false,
+        },
+
+        send_read_receipts: bool {
+            // Description
+            "Send public read receipts when marking a room as read",
+            // Default value.
+            true,
+        },
+    },
+
+    Section input {
+        markdown_input: bool {
+            // Description
+            "Should the input be parsed as markdown",
+            // Default value.
+            true,
+        },
+    },
+
+    Section media {
+        download_prefix: String {
+            // Description.
+            "Prefix prepended to default media download filenames. The value \
+             may include a directory, and supports ~, $XDG_STATE_HOME, and \
+             ${XDG_STATE_HOME}",
+            // Default value.
+            "matrix-media-",
+        },
+    },
+);
+
+/// A wrapper for our config struct that can be cloned around.
+#[derive(Clone)]
+pub struct ConfigHandle {
+    pub inner: Rc<RefCell<Config>>,
+    servers: Servers,
+}
+
+impl ConfigHandle {
+    /// Create a new config and wrap it in our config handle.
+    pub fn new(servers: &Servers) -> ConfigHandle {
+        let config = Config::new().expect("Can't create new config");
+
+        let config = ConfigHandle {
+            inner: Rc::new(RefCell::new(config)),
+            servers: servers.clone(),
+        };
+
+        // The server section is special since it has a custom section read and
+        // write implementations to support subsections for every configured
+        // server.
+        let server_section_options = ConfigSectionSettings::new("server")
+            .set_write_callback(
+                |_weechat: &Weechat,
+                 config: &Conf,
+                 section: &mut ConfigSection| {
+                    let mut options = section.options();
+                    options.sort_by(|a, b| a.name().cmp(&b.name()));
+
+                    config.write_section(section.name());
+                    for option in options {
+                        config.write_option(option);
+                    }
+                },
+            )
+            .set_read_callback(config.clone());
+
+        {
+            let mut config_borrow = config.borrow_mut();
+
+            config_borrow
+                .new_section(server_section_options)
+                .expect("Can't create server section");
+
+            let mut look_section = config_borrow.look_mut();
+
+            let servers = servers.clone();
+
+            #[cfg(weechat410)]
+            {
+                let settings = IntegerOptionSettings::new("server_buffer")
+                    .description("Should the server buffer be merged with other buffers or independent")
+                    .set_change_callback(move |_, _| {
+                        for server in servers.borrow().values() {
+                            server.merge_server_buffers();
+                        }
+                    })
+                    .default_value(ServerBuffer::default() as i32)
+                    .string_values(
+                        ServerBuffer::VARIANTS
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>(),
+                    );
+
+                look_section
+                    .new_integer_option(settings)
+                    .expect("Can't create server buffers option");
+            }
+
+            #[cfg(not(weechat410))]
+            {
+                let settings = EnumOptionSettings::new("server_buffer")
+                    .description("Should the server buffer be merged with other buffers or independent")
+                    .set_change_callback(move |_, _| {
+                        for server in servers.borrow().values() {
+                            server.merge_server_buffers();
+                        }
+                    })
+                    .default_value(ServerBuffer::default() as i32)
+                    .string_values(
+                        ServerBuffer::VARIANTS
+                            .iter()
+                            .map(|v| v.to_string())
+                            .collect::<Vec<String>>(),
+                    );
+
+                look_section
+                    .new_enum_option(settings)
+                    .expect("Can't create server buffers option");
+            }
+        }
+
+        config
+    }
+
+    pub fn borrow(&self) -> Ref<'_, Config> {
+        self.inner.borrow()
+    }
+
+    pub fn borrow_mut(&self) -> RefMut<'_, Config> {
+        self.inner.borrow_mut()
+    }
+}
+
+impl LookSection<'_> {
+    pub fn server_buffer(&self) -> ServerBuffer {
+        match self.search_option("server_buffer").unwrap() {
+            #[cfg(weechat410)]
+            ConfigOption::Integer(o) => ServerBuffer::from(o.value()),
+            #[cfg(not(weechat410))]
+            ConfigOption::Enum(o) => ServerBuffer::from(o.value()),
+            _ => panic!("Server buffer option has the wrong type"),
+        }
+    }
+}
+
+impl SectionReadCallback for ConfigHandle {
+    fn callback(
+        &mut self,
+        _: &Weechat,
+        _: &Conf,
+        section: &mut ConfigSection,
+        option_name: &str,
+        option_value: &str,
+    ) -> OptionChanged {
+        if option_name.is_empty() {
+            return OptionChanged::Error;
+        }
+
+        let option_args: Vec<&str> = option_name.splitn(2, '.').collect();
+
+        if option_args.len() != 2 {
+            return OptionChanged::Error;
+        }
+
+        let server_name = option_args[0];
+
+        // We are reading the config, if the server doesn't yet exists
+        // we need to create it before setting the option and running
+        // the option change callback.
+        if !self.servers.contains(server_name) {
+            let server = MatrixServer::new(
+                server_name,
+                self,
+                section,
+                self.servers.clone(),
+            );
+            self.servers.insert(server);
+        }
+
+        let option = section.search_option(option_name);
+
+        if let Some(o) = option {
+            o.set(option_value, true)
+        } else {
+            OptionChanged::NotFound
+        }
+    }
+}

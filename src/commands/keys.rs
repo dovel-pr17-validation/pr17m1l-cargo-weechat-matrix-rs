@@ -1,0 +1,149 @@
+use std::path::PathBuf;
+
+use clap::{
+    App as Argparse, AppSettings as ArgParseSettings, Arg, ArgMatches,
+    SubCommand,
+};
+use matrix_sdk::ruma::{OwnedRoomId, RoomId};
+
+use weechat::{
+    buffer::Buffer,
+    hooks::{Command, CommandCallback, CommandSettings},
+    Args, Weechat,
+};
+
+use super::parse_and_run;
+use crate::{MatrixServer, Servers};
+
+pub struct KeysCommand {
+    servers: Servers,
+}
+
+impl KeysCommand {
+    pub const DESCRIPTION: &'static str = "Import or export E2EE keys.";
+    pub const COMPLETION: &'static str = "import|export %(filename)";
+    pub const SETTINGS: &'static [ArgParseSettings] = &[
+        ArgParseSettings::DisableHelpFlags,
+        ArgParseSettings::DisableVersion,
+        ArgParseSettings::VersionlessSubcommands,
+        ArgParseSettings::SubcommandRequiredElseHelp,
+    ];
+
+    pub fn create(servers: &Servers) -> Result<Command, ()> {
+        let settings = CommandSettings::new("keys")
+            .description(Self::DESCRIPTION)
+            .add_argument("import <file> <passphrase>")
+            .add_argument("export [--room-id <room-id>] <file> <passphrase>")
+            .arguments_description(
+                "file: Path to a file that is or will contain the E2EE keys export",
+            )
+            .add_completion(Self::COMPLETION)
+            .add_completion("help import|export");
+
+        Command::new(
+            settings,
+            Self {
+                servers: servers.clone(),
+            },
+        )
+    }
+
+    fn upcast_args(args: &ArgMatches) -> (PathBuf, String) {
+        let passphrase = args
+            .args
+            .get("passphrase")
+            .and_then(|p| p.vals.first().map(|p| p.clone().into_string().ok()))
+            .flatten()
+            .expect("No passphrase found");
+
+        let file = args
+            .args
+            .get("file")
+            .and_then(|f| f.vals.first())
+            .expect("No file found");
+        let file = Weechat::expand_home(&file.to_string_lossy());
+        let file = PathBuf::from(file);
+        (file, passphrase)
+    }
+
+    fn import(server: MatrixServer, file: PathBuf, passphrase: String) {
+        let import = || async move {
+            server.import_keys(file, passphrase).await;
+        };
+        Weechat::spawn(import()).detach();
+    }
+
+    fn export(
+        server: MatrixServer,
+        file: PathBuf,
+        passphrase: String,
+        room_id: Option<OwnedRoomId>,
+    ) {
+        let export = || async move {
+            server.export_keys(file, passphrase, room_id).await;
+        };
+        Weechat::spawn(export()).detach();
+    }
+
+    pub fn run(buffer: &Buffer, servers: &Servers, args: &ArgMatches) {
+        if let Some(server) = servers.find_server(buffer) {
+            match args.subcommand() {
+                ("import", args) => {
+                    let (file, passphrase) = Self::upcast_args(
+                        args.expect("No args were provided to the subcommand"),
+                    );
+                    Self::import(server, file, passphrase);
+                }
+                ("export", args) => {
+                    let args =
+                        args.expect("No args were provided to the subcommand");
+                    let (file, passphrase) = Self::upcast_args(args);
+                    let room_id = args
+                        .value_of("room-id")
+                        .map(|room_id| RoomId::parse(room_id).unwrap());
+                    Self::export(server, file, passphrase, room_id);
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            Weechat::print("Must be executed on Matrix buffer")
+        }
+    }
+
+    pub fn subcommands() -> Vec<Argparse<'static, 'static>> {
+        vec![
+            SubCommand::with_name("import")
+                .about("Import the E2EE keys from the given file.")
+                .arg(Arg::with_name("file").required(true))
+                .arg(Arg::with_name("passphrase").required(true)),
+            SubCommand::with_name("export")
+                .about("Export your E2EE keys to the given file.")
+                .arg(
+                    Arg::with_name("room-id")
+                        .long("room-id")
+                        .takes_value(true)
+                        .value_name("room-id")
+                        .validator(|room_id| {
+                            RoomId::parse(room_id).map(|_| ()).map_err(|_| {
+                                "The given room ID isn't valid".to_owned()
+                            })
+                        }),
+                )
+                .arg(Arg::with_name("file").required(true))
+                .arg(Arg::with_name("passphrase").required(true)),
+        ]
+    }
+}
+
+impl CommandCallback for KeysCommand {
+    fn callback(&mut self, _: &Weechat, buffer: &Buffer, arguments: Args) {
+        let argparse = Argparse::new("keys")
+            .about(Self::DESCRIPTION)
+            .settings(Self::SETTINGS)
+            .subcommands(Self::subcommands());
+
+        parse_and_run(argparse, arguments, |matches| {
+            Self::run(buffer, &self.servers, matches)
+        });
+    }
+}
