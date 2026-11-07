@@ -63,7 +63,7 @@ features = ["async", "config_macro"]
 git = "https://github.com/poljar/rust-weechat"
 
 [dependencies.matrix-sdk]
-version = "0.18.0"
+version = "0.19.1"
 # git = "https://github.com/matrix-org/matrix-rust-sdk.git"
 # rev = "92192c549b3f53889c23954386743867a73b31b1"
 features = ["markdown", "socks", "qrcode", "sso-login"]
